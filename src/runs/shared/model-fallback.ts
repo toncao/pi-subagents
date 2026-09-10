@@ -3,6 +3,7 @@ import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 import { redactSecretValues } from "./permissions.ts";
+import { getProviderLiveness } from "./provider-liveness.ts";
 
 export type { AvailableModelInfo };
 
@@ -330,14 +331,52 @@ function isCurrentRegistryModel(candidate: string, availableModels: AvailableMod
 	return availableModels.some((entry) => entry.fullId === baseModel);
 }
 
-function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+/**
+ * A record whose model was missing from the registry then, but is present now.
+ * Describes a registry we no longer have.
+ *
+ * Deliberately NOT applied to explicitly requested models: a pinned model that
+ * once failed to resolve is a configuration signal worth surfacing loudly
+ * rather than silently proceeding past.
+ */
+function isStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
 	const reason = exclusion.reason ?? "";
 	return MODEL_UNAVAILABLE_EXCLUSION_PATTERNS.some((pattern) => pattern.test(reason)) && isCurrentRegistryModel(candidate, availableModels);
 }
 
-function throwForExplicitModelExclusion(model: string): void {
+/**
+ * A limit-class record (429 / quota / usage limit) whose account is serving again.
+ *
+ * Such a record describes a shared *account*, not this model, and the provider
+ * refills that account on its own schedule. When `pi-multi-account` publishes a
+ * fresh verdict that the account is live, that reading outranks our stored copy
+ * of a past refusal: one 429 must not blockade a healthy account for the whole
+ * exclusion TTL. A provider-side limit is the provider's to enforce and to
+ * lift — not ours to cache past its lifetime.
+ *
+ * Any provider whose liveness is `"unknown"` (no companion installed, stale
+ * snapshot, unparseable state) keeps its exclusion, so absent evidence the
+ * conservative path is unchanged.
+ */
+function isRecoveredLimitExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>): boolean {
+	const reason = exclusion.reason ?? "";
+	if (!RUNTIME_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(reason))) return false;
+	const { provider } = parseModelKey(candidate);
+	return getProviderLiveness(provider ?? exclusion.provider, Date.now(), exclusion.recordedAt) === "live";
+}
+
+function ignoreStaleExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+	return isStaleModelUnavailableExclusion(candidate, exclusion, availableModels) || isRecoveredLimitExclusion(candidate, exclusion);
+}
+
+function throwForExplicitModelExclusion(model: string, _availableModels: AvailableModelInfo[] | undefined): void {
 	const exclusion = findModelExclusion(model);
 	if (!exclusion) return;
+	// An explicitly pinned model has no fallback chain to fall through to, so a
+	// stale limit record here is strictly more damaging than on a fallback
+	// candidate: it fails the launch outright. It clears on live provider
+	// evidence. Model-unavailable records stay strict (see above).
+	if (isRecoveredLimitExclusion(model, exclusion)) return;
 	const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
 	const expiry = Number.isFinite(exclusion.expiresAt) ? `; expires: ${new Date(exclusion.expiresAt).toISOString()}` : "";
 	throw new Error(`Requested subagent model '${model}' is excluded and cannot be replaced by a fallback (reason: ${reason}${expiry}).`);
@@ -379,7 +418,7 @@ export function resolveSubagentModelOverride(
 		const candidate = resolveSubagentModelCandidate(explicit, availableModels, preferredProvider);
 		if (options?.source === "explicit") {
 			resolved = candidate ?? resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
-			throwForExplicitModelExclusion(resolved);
+			throwForExplicitModelExclusion(resolved, availableModels);
 			resolvedFromRegistry = true;
 		} else if (candidate) {
 			resolved = candidate;
@@ -482,7 +521,7 @@ export function buildModelCandidates(
 	};
 	if (origin === "explicit" && primaryModel) {
 		const normalized = resolveRequiredSubagentModelCandidate(primaryModel.trim(), availableModels, preferredProvider);
-		throwForExplicitModelExclusion(normalized);
+		throwForExplicitModelExclusion(normalized, availableModels);
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		primaryModel = normalized;
 	}
@@ -515,7 +554,7 @@ export function buildModelCandidates(
 	}
 	const resolved = filterFallbackCandidates(candidates, {
 		onExcluded: warnCachedExclusion,
-		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleExclusion(candidate, exclusion, availableModels),
 	});
 	if (resolved.length === 0) {
 		if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
