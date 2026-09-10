@@ -608,6 +608,86 @@ export function isRetryableModelFailureAttempt(input: { error: string | undefine
 	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
 }
 
+/** A deliberately small user message: the existing transcript carries the task and completed tool results. */
+export const SAME_SESSION_ACCOUNT_FALLBACK_NOTICE =
+	"The previous account reached a runtime rate or quota limit. Continue the same task from the existing conversation and completed tool results. Do not repeat completed tool calls or redo completed work.";
+
+const RUNTIME_RATE_LIMIT_PATTERNS = [
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/\b429\b/,
+	/quota/i,
+];
+
+function accountProviderFamily(provider: string | undefined): string | undefined {
+	if (!provider) return undefined;
+	if (/^anthropic(?:-\d+|-account-\d+)?$/i.test(provider)) return "anthropic";
+	if (/^openai-codex(?:-\d+|-account-\d+)?$/i.test(provider)) return "openai-codex";
+	const legacy = /^(.*)-account-\d+$/i.exec(provider);
+	return legacy?.[1]?.toLowerCase() ?? provider.toLowerCase();
+}
+
+/** Only account aliases for the exact same model are eligible for post-tool continuation. */
+export function isSameModelAccountFallback(currentModel: string | undefined, nextModel: string | undefined): boolean {
+	if (!currentModel || !nextModel) return false;
+	const current = parseModelKey(currentModel);
+	const next = parseModelKey(nextModel);
+	if (!current.provider || !next.provider || current.modelId !== next.modelId) return false;
+	const currentFamily = accountProviderFamily(current.provider);
+	return currentFamily === accountProviderFamily(next.provider) && current.provider.toLowerCase() !== next.provider.toLowerCase();
+}
+
+function completedToolHistory(messages: readonly unknown[]): { completed: number; safe: boolean } {
+	const pending = new Set<string>();
+	let completed = 0;
+	for (const raw of messages) {
+		if (!raw || typeof raw !== "object") continue;
+		const message = raw as { role?: unknown; content?: unknown; toolCallId?: unknown; isError?: unknown };
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const part of message.content) {
+				if (!part || typeof part !== "object" || (part as { type?: unknown }).type !== "toolCall") continue;
+				const id = (part as { id?: unknown }).id;
+				if (typeof id !== "string" || !id) return { completed, safe: false };
+				pending.add(id);
+			}
+		}
+		if (message.role !== "toolResult") continue;
+		if (message.isError === true || typeof message.toolCallId !== "string" || !pending.delete(message.toolCallId)) {
+			return { completed, safe: false };
+		}
+		completed++;
+	}
+	return { completed, safe: pending.size === 0 };
+}
+
+/**
+ * Fail closed unless a trusted terminal assistant rate/quota error follows a
+ * fully paired, error-free tool history. Tool text merely mentioning 429 can
+ * never satisfy this predicate.
+ */
+export function canContinueSameSessionAfterRateLimit(input: {
+	currentModel?: string;
+	nextModel?: string;
+	error?: string;
+	messages?: readonly unknown[];
+	toolCount?: number;
+	currentTool?: string;
+	cancelled?: boolean;
+	budgetExhausted?: boolean;
+	structuredOutputInvoked?: boolean;
+}): boolean {
+	if (!isSameModelAccountFallback(input.currentModel, input.nextModel)) return false;
+	if (input.cancelled || input.budgetExhausted || input.structuredOutputInvoked || input.currentTool) return false;
+	if ((input.toolCount ?? 0) <= 0 || !input.error || !RUNTIME_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(input.error!))) return false;
+	const messages = input.messages ?? [];
+	const terminal = messages.at(-1) as { role?: unknown; stopReason?: unknown; errorMessage?: unknown } | undefined;
+	if (terminal?.role !== "assistant" || terminal.stopReason !== "error") return false;
+	if (typeof terminal.errorMessage !== "string" || terminal.errorMessage.trim() !== input.error.trim()) return false;
+	const history = completedToolHistory(messages);
+	return history.safe && history.completed > 0;
+}
+
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
 	if (!model || !isRetryableModelFailure(error)) return;
 	const { provider, modelId } = parseModelKey(model);

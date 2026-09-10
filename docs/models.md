@@ -114,6 +114,8 @@ fallbackModels: openai-codex/gpt-5.5:high
 
 One interaction worth knowing for tier 4: forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
 
+After a child has completed tools, runtime rate/quota recovery is narrower than ordinary fallback: it can continue only in the same live child session, only to another account alias for the exact same model, and only when the tool-call history is fully paired and successful. Cancellation, an active tool, exhausted run/tool budgets, structured output, a different model, or an untrusted/non-terminal error disables continuation. The child receives a short continuation notice over its retained transcript and tool results; the original `Task:` is not replayed. The default model-exclusion TTL remains 24 hours.
+
 ## Thinking level defaults
 
 Set `subagents.defaultThinking` to give builtin, package, user, and project agents without a `thinking` value a shared thinking level, independent of the parent session's default. Project settings win over user settings. Matching `agentOverrides.<name>.thinking` and per-run thinking overrides replace frontmatter; otherwise explicit frontmatter remains in effect. `thinking: false` remains an explicit opt-out:

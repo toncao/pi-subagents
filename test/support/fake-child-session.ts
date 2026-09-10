@@ -47,7 +47,10 @@ export interface FakeChildResponse {
 export interface FakeChildSessionRecord {
 	launch: ChildSessionLaunch;
 	task: string | undefined;
+	/** Every prompt sent to this one live session, including continuation notices. */
+	tasks: string[];
 	steers: Array<{ text: string; mode: "steer" | "followUp" }>;
+	switchedModels: string[];
 	aborted: boolean;
 	disposed: boolean;
 	settled: boolean;
@@ -205,11 +208,12 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 	let disposeCalls = 0;
 	const factory: ChildSessionFactory = {
 		async create(launch) {
-			const record: FakeChildSessionRecord = { launch, task: undefined, steers: [], aborted: false, disposed: false, settled: false };
+			const record: FakeChildSessionRecord = { launch, task: undefined, tasks: [], steers: [], switchedModels: [], aborted: false, disposed: false, settled: false };
 			sessions.push(record);
 			const listeners = new Set<(event: ChildSessionEvent) => void>();
 			const messages: AgentMessage[] = [];
-			const model = reportedModel(launch.model);
+			let selectedModel = launch.model;
+			let model = reportedModel(selectedModel);
 			let abortResolve: (() => void) | undefined;
 			const abortedPromise = new Promise<void>((resolve) => { abortResolve = resolve; });
 			const sessionId = randomUUID();
@@ -336,13 +340,15 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				},
 				async prompt(text) {
 					record.task = text;
+					record.tasks.push(text);
 					const systemPrompt = launch.systemPrompt ?? launch.appendSystemPrompt ?? "";
-					const args = fakeChildArgs(launch, text);
+					const args = fakeChildArgs({ ...launch, ...(selectedModel ? { model: selectedModel } : {}) }, text);
 					const response = claimNextResponse(queueDir(), `${args.join("\n")}\n${systemPrompt}`);
 					const dir = queueDir();
 					fs.mkdirSync(dir, { recursive: true });
 					const callPath = path.join(dir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
 					fs.writeFileSync(callPath, JSON.stringify({
+						sessionId,
 						args,
 						effectiveArgs: args,
 						cwd: launch.cwd,
@@ -381,6 +387,11 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				async followUp(text) {
 					record.steers.push({ text, mode: "followUp" });
 					recordSteer(text, "followUp");
+				},
+				async switchModel(nextModel) {
+					selectedModel = nextModel;
+					model = reportedModel(selectedModel);
+					record.switchedModels.push(nextModel);
 				},
 				async abort() {
 					record.aborted = true;

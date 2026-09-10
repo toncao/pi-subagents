@@ -75,11 +75,13 @@ import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTr
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
+	canContinueSameSessionAfterRateLimit,
 	formatSubagentModelVerificationError,
 	formatModelAttemptNote,
 	isContextOverflow,
 	isRetryableModelFailureAttempt,
 	recordRetryableModelFailure,
+	SAME_SESSION_ACCOUNT_FALLBACK_NOTICE,
 } from "../shared/model-fallback.ts";
 import {
 	createMutatingFailureState,
@@ -138,6 +140,21 @@ function sumUsage(target: Usage, source: Usage): void {
 	target.cacheWrite += source.cacheWrite;
 	target.cost += source.cost;
 	target.turns += source.turns;
+}
+
+function usageAfterAttempts(total: Usage, attempts: readonly ModelAttempt[]): Usage {
+	const used = emptyUsage();
+	for (const attempt of attempts) {
+		if (attempt.usage) sumUsage(used, attempt.usage);
+	}
+	return {
+		input: total.input - used.input,
+		output: total.output - used.output,
+		cacheRead: total.cacheRead - used.cacheRead,
+		cacheWrite: total.cacheWrite - used.cacheWrite,
+		cost: total.cost - used.cost,
+		turns: total.turns - used.turns,
+	};
 }
 
 function persistSingleResultMetadata(input: {
@@ -340,6 +357,11 @@ function structuredDelegationProgressChanged(
 
 const AFTER_COMPACTION_SETTLEMENT = Symbol("afterCompactionSettlement");
 type AbortRecoverySingleResult = SingleResult & { [AFTER_COMPACTION_SETTLEMENT]?: true };
+interface SameSessionAccountFallback {
+	attemptedCandidates: string[];
+	failedAttempts: Array<ModelAttempt & { success: false; exitCode: 1; error: string; usage: Usage }>;
+}
+const sameSessionAccountFallbackByResult = new WeakMap<SingleResult, SameSessionAccountFallback>();
 
 const STOPPED_BEFORE_COMPLETION_ERROR = "Subagent stopped before completion.";
 
@@ -365,12 +387,17 @@ async function runSingleAttempt(
 		orcaProgressTab?: OrcaProgressTab;
 		launchWarnings: { emitted: boolean };
 		verifyModel: boolean;
+		/** Ordered, already-resolved candidates after this attempt's launch model. */
+		accountFallbackCandidates?: readonly string[];
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	assertThinkingWithinCeiling({ model: modelArg, configThinking: effectiveThinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
-	const expectedModelForVerification = shared.verifyModel ? modelArg : undefined;
+	let expectedModelForVerification = shared.verifyModel ? modelArg : undefined;
+	let selectedCandidate = modelArg;
+	const attemptedAccountCandidates = selectedCandidate ? [selectedCandidate] : [];
+	const failedAccountAttempts: SameSessionAccountFallback["failedAttempts"] = [];
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
 	// Display name for the child session: applied inside the child through its
 	// runtime config and echoed back on the result payload so hosts can label
@@ -1369,7 +1396,55 @@ async function runSingleAttempt(
 					abortChild();
 				}
 				options.onChildSession?.({ steer: (text) => created.steer(text), followUp: (text) => created.followUp(text) });
-				await created.prompt(`Task: ${task}`);
+				let prompt = `Task: ${task}`;
+				let fallbackIndex = 0;
+				for (;;) {
+					await created.prompt(prompt);
+					const nextCandidate = shared.accountFallbackCandidates?.[fallbackIndex];
+					if (!canContinueSameSessionAfterRateLimit({
+						currentModel: selectedCandidate,
+						nextModel: nextCandidate,
+						error: result.error ?? assistantError,
+						messages: result.messages,
+						toolCount: progress.toolCount,
+						currentTool: progress.currentTool,
+						cancelled: abortedBySignal || interruptedByControl || result.timedOut || result.stopped,
+						budgetExhausted: result.toolBudgetBlocked,
+						structuredOutputInvoked: structuredOutputToolInvoked,
+					})) break;
+					const failure = (result.error ?? assistantError)!;
+					const failedUsage = usageAfterAttempts(result.usage, failedAccountAttempts);
+					// The failed prompt emitted agent_settled, which armed the normal final
+					// drain. Cancel it before auth/model switching can await.
+					clearFinalDrainTimers();
+					clearWatchdogTailTimer();
+					appendRecentOutput(progress, [`[fallback] ${selectedCandidate} reached a runtime rate/quota limit. Continuing the same session with ${nextCandidate}.`]);
+					try {
+						await created.switchModel(nextCandidate!);
+					} catch (switchError) {
+						result.error = `Could not switch the live child session to '${nextCandidate}': ${switchError instanceof Error ? switchError.message : String(switchError)}`;
+						assistantError = undefined;
+						throw switchError;
+					}
+					if (abortedBySignal || interruptedByControl || result.timedOut || result.stopped) break;
+					failedAccountAttempts.push({ model: selectedCandidate!, success: false, exitCode: 1, error: failure, usage: failedUsage });
+					fallbackIndex++;
+					selectedCandidate = nextCandidate;
+					expectedModelForVerification = nextCandidate;
+					attemptedAccountCandidates.push(nextCandidate!);
+					result.model = nextCandidate;
+					progress.model = nextCandidate;
+					result.error = undefined;
+					assistantError = undefined;
+					cleanTerminalAssistantStopReceived = false;
+					agentSettledReceived = false;
+					compactionStartedReceived = false;
+					afterCompactionSettlement = false;
+					forcedTermination = false;
+					childLifecycleState.compactionRetryActive = false;
+					prompt = SAME_SESSION_ACCOUNT_FALLBACK_NOTICE;
+					fireUpdate();
+				}
 				settle(undefined);
 			} catch (error) {
 				settle(error ?? new Error("Child session failed."));
@@ -1377,6 +1452,12 @@ async function runSingleAttempt(
 		})();
 	});
 	result.exitCode = exitCode;
+	if (failedAccountAttempts.length > 0) {
+		sameSessionAccountFallbackByResult.set(result, {
+			attemptedCandidates: attemptedAccountCandidates,
+			failedAttempts: failedAccountAttempts,
+		});
+	}
 	if (afterCompactionSettlement) {
 		(result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT] = true;
 	}
@@ -1883,7 +1964,9 @@ async function runSyncCompletionInner(
 		},
 	};
 	let lastResult: SingleResult | undefined;
-	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
+	const modelsToTry = candidates.length > 0
+		? candidates.map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
+		: [undefined];
 	let abortRecoveryAttempted = false;
 	let nextAttemptTask = taskWithAcceptance;
 	modelAttemptsLoop: for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
@@ -1911,24 +1994,34 @@ async function runSyncCompletionInner(
 				orcaProgressTab,
 				launchWarnings,
 				verifyModel,
+				accountFallbackCandidates: modelsToTry.slice(modelIndex + 1).filter((fallback): fallback is string => Boolean(fallback)),
 			});
 			lastResult = result;
+			const accountFallback = sameSessionAccountFallbackByResult.get(result);
 			if (!recoveringAbort) {
-				if (result.model) attemptedModels.push(result.model);
+				if (accountFallback) attemptedModels.push(...accountFallback.attemptedCandidates);
+				else if (result.model) attemptedModels.push(result.model);
 				else if (candidate) attemptedModels.push(candidate);
 			}
 			sumUsage(aggregateUsage, result.usage);
 			totalToolCount += result.progressSummary?.toolCount ?? 0;
 			totalDurationMs += result.progressSummary?.durationMs ?? 0;
 			const attemptSucceeded = result.exitCode === 0 && !result.error;
+			for (let index = 0; index < (accountFallback?.failedAttempts.length ?? 0); index++) {
+				const failedAttempt = accountFallback!.failedAttempts[index]!;
+				modelAttempts.push(failedAttempt);
+				recordRetryableModelFailure(failedAttempt.model, failedAttempt.error);
+				attemptNotes.push(formatModelAttemptNote(failedAttempt, accountFallback!.attemptedCandidates[index + 1]));
+			}
 			const attempt: ModelAttempt = {
-				model: result.model ?? candidate ?? agent.model ?? "default",
+				model: accountFallback?.attemptedCandidates.at(-1) ?? result.model ?? candidate ?? agent.model ?? "default",
 				success: attemptSucceeded,
 				exitCode: result.exitCode,
 				error: result.error,
-				usage: { ...result.usage },
+				usage: usageAfterAttempts(result.usage, accountFallback?.failedAttempts ?? []),
 			};
 			modelAttempts.push(attempt);
+			modelIndex += accountFallback?.failedAttempts.length ?? 0;
 			if (!attemptSucceeded) {
 				const afterCompactionSettlement = (result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT];
 				const abortRecovery = planAbortRecovery({
