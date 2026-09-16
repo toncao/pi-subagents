@@ -461,6 +461,9 @@ function inheritedRunFanoutBudget(deps: Pick<ExecutorDeps, "childRuntime">): Run
 type ForkSessionFileForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => string | undefined;
 type PrepareForkSessionForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => Promise<void>;
 type ForkThinkingOverrideForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => AgentConfig["thinking"] | undefined;
+/** Whether this task's fork had signed Anthropic thinking blocks stripped, so only the
+ * Anthropic candidates need thinking pinned off while the rest keep reasoning. */
+type ForkSanitizedForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => boolean;
 
 interface ExecutionContextData {
 	params: SubagentParamsLike;
@@ -481,6 +484,7 @@ interface ExecutionContextData {
 	sessionFileForIndex: (idx?: number) => string | undefined;
 	sessionFileForTask: ForkSessionFileForTask;
 	thinkingOverrideForTask: ForkThinkingOverrideForTask;
+	forkSanitizedForTask: ForkSanitizedForTask;
 	artifactConfig: ArtifactConfig;
 	artifactsDir: string;
 	backgroundRequestedWhileClarifying: boolean;
@@ -3194,6 +3198,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		sessionRoot,
 		sessionFileForTask,
 		thinkingOverrideForTask,
+		forkSanitizedForTask,
 		artifactConfig,
 		artifactsDir,
 		effectiveAsync,
@@ -3304,6 +3309,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			modelOverrideFromParent,
 			modelOrigin,
 			thinkingOverride: externalRunnerWithoutExplicitModel ? undefined : thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
+			forkSanitized: externalRunnerWithoutExplicitModel ? false : forkSanitizedForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
 			thinkingCeiling: a.maxThinking,
 			maxSubagentDepth,
 			waitToolEnabled: deps.waitToolEnabled,
@@ -3659,6 +3665,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		sessionDirForIndex,
 		sessionFileForTask,
 		thinkingOverrideForTask,
+		forkSanitizedForTask,
 		shareEnabled,
 		artifactConfig,
 		artifactsDir,
@@ -3882,6 +3889,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			modelOverrideFromParent,
 			modelOrigin,
 			thinkingOverride: thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
+			forkSanitized: forkSanitizedForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
 			thinkingCeiling: agentConfig.maxThinking,
 			extensionBindings: params.extensionBindings,
 			availableModels,
@@ -6438,6 +6446,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		let forkSessionFileForIndex: (idx?: number) => string | undefined = () => undefined;
 		let prepareForkSessionForIndex: (idx?: number) => Promise<void> = async () => {};
 		let forkThinkingOverrideForIndex: (idx?: number) => AgentConfig["thinking"] | undefined = () => undefined;
+		let forkSanitizedForIndex: (idx?: number) => boolean = () => false;
 		let prepareForkThinking = (_agentName: string, _index: number, _modelOverride?: string, _modelOverrideFromParent?: boolean, _modelOrigin?: ModelOrigin): void => {};
 		const forkThinkingRequirements = new Map<number, boolean>();
 		const forkThinkingDowngrades = new Map<number, string>();
@@ -6480,10 +6489,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						origin,
 					},
 				);
+				// Force the chain-wide `off` only when no candidate could reason anyway.
+				// When at least one candidate can (a self-hosted or OpenAI primary with
+				// Anthropic fallbacks), keep the configured thinking level and pin `:off`
+				// onto just the Anthropic candidates instead, so forked delegation does
+				// not silently lose reasoning for every provider in the chain.
 				forkThinkingRequirements.set(
 					index,
 					candidates.length === 0
-						|| candidates.some((candidate) => forkedChildRequiresThinkingOff(candidate, forkAvailableModels, parentModel?.provider)),
+						|| candidates.every((candidate) => forkedChildRequiresThinkingOff(candidate, forkAvailableModels, parentModel?.provider)),
 				);
 			};
 			const pruneSession = contextPolicy.usesFork && deps.config.forkContext?.mode === "pruned"
@@ -6496,6 +6510,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			prepareForkSessionForIndex = forkContextResolver.prepareSessionForIndex;
 			forkSessionFileForIndex = forkContextResolver.sessionFileForIndex;
 			forkThinkingOverrideForIndex = forkContextResolver.thinkingOverrideForIndex;
+			forkSanitizedForIndex = forkContextResolver.sanitizedForIndex;
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary);
 		}
@@ -6615,6 +6630,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (override === "off") forkThinkingDowngrades.set(idx, agentName);
 			return override ?? delegatedThinkingOverride;
 		};
+		const forkSanitizedForTask = (agentName: string, idx = 0, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin): boolean => {
+			if (!shouldForkAgent(contextPolicy, agentName)) return false;
+			prepareForkThinking(agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin);
+			return forkSanitizedForIndex(idx);
+		};
 		const childSessionFileForTask: ForkSessionFileForTask = (agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin) =>
 			forkSessionFileForTask(agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin) ?? path.join(sessionDirForIndex(idx), "session.jsonl");
 		const childSessionFileForIndex = (idx?: number) =>
@@ -6704,6 +6724,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			sessionFileForIndex: childSessionFileForIndex,
 			sessionFileForTask: childSessionFileForTask,
 			thinkingOverrideForTask: forkThinkingOverrideForTask,
+			forkSanitizedForTask,
 			artifactConfig,
 			artifactsDir,
 			backgroundRequestedWhileClarifying,

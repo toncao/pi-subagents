@@ -28,7 +28,7 @@ import { backgroundProcessOptions } from "../shared/background-process-options.t
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
-import { buildModelCandidates, resolveEffectiveSubagentModel, resolveModelOrigin, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-fallback.ts";
+import { applyForkThinkingToCandidates, applyForkThinkingToModel, buildModelCandidates, resolveEffectiveSubagentModel, resolveModelOrigin, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-fallback.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -249,6 +249,9 @@ interface AsyncSingleParams {
 	modelOrigin?: ModelOrigin;
 	fast?: boolean;
 	thinkingOverride?: AgentConfig["thinking"];
+	/** The forked transcript had signed Anthropic thinking blocks stripped, so Anthropic
+	 * candidates must launch with thinking off while other providers keep reasoning. */
+	forkSanitized?: boolean;
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
 	waitToolEnabled?: boolean;
@@ -1708,7 +1711,12 @@ export function executeAsyncSingle(
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 	}
 	const effectiveThinking = externalRunner ? undefined : params.thinkingOverride ?? agentConfig.thinking;
-	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
+	const forkThinkingPolicy = {
+		sanitized: params.forkSanitized === true,
+		availableModels,
+		preferredProvider: agentConfig.modelProvider ?? ctx.currentModelProvider,
+	};
+	const model = externalRunner ? undefined : applyThinkingSuffix(applyForkThinkingToModel(primaryModel, forkThinkingPolicy), effectiveThinking, params.thinkingOverride !== undefined);
 	const contextLimit = model ? findModelInfo(model, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		params.thinkingCeiling,
@@ -1746,11 +1754,11 @@ export function executeAsyncSingle(
 	let modelCandidates: string[] = [];
 	if (!externalRunner) {
 		try {
-			modelCandidates = buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
+			modelCandidates = applyForkThinkingToCandidates(buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
 				scope: modelScopes,
 				primaryModelFromParent: modelOrigin === "inherited",
 				origin: modelOrigin,
-			}).flatMap((candidate) => {
+			}), forkThinkingPolicy).flatMap((candidate) => {
 				const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
 				return resolved ? [resolved] : [];
 			});

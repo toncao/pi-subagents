@@ -47,12 +47,17 @@ interface ForkContextResolverOptions {
 interface ForkContextResolution {
 	sessionFile: string;
 	thinkingOverride?: "off";
+	/** True when signed/redacted Anthropic thinking blocks were stripped from this fork. */
+	sanitized: boolean;
 }
 
 interface ForkContextResolver {
 	prepareSessionForIndex(index?: number): Promise<void>;
 	sessionFileForIndex(index?: number): string | undefined;
 	thinkingOverrideForIndex(index?: number): "off" | undefined;
+	/** Whether the fork transcript was sanitized, independent of the blanket thinking
+	 * decision. Callers use this to disable thinking per candidate instead of chain-wide. */
+	sanitizedForIndex(index?: number): boolean;
 }
 
 export function resolveSubagentContext(value: unknown): SubagentExecutionContext {
@@ -184,6 +189,7 @@ export function createForkContextResolver(
 			prepareSessionForIndex: async () => {},
 			sessionFileForIndex: () => undefined,
 			thinkingOverrideForIndex: () => undefined,
+			sanitizedForIndex: () => false,
 		};
 	}
 
@@ -236,13 +242,15 @@ export function createForkContextResolver(
 			const forceThinkingOff = (sanitized: boolean): boolean =>
 				sanitized && (options.forceThinkingOffForIndex?.(index) ?? true);
 			let thinkingOverride: "off" | undefined;
+			let transcriptSanitized = false;
 			if (!fs.existsSync(sessionFile)) {
 				const header = sourceManager.getHeader?.();
 				const entries = sourceManager.getEntries?.();
 				if (!header || !entries) {
 					throw new Error(`Session manager returned a forked session file that does not exist and cannot be persisted by fallback: ${sessionFile}`);
 				}
-				if (forceThinkingOff(sanitizeUnsafeThinkingBlocks(entries))) {
+				transcriptSanitized = sanitizeUnsafeThinkingBlocks(entries);
+				if (forceThinkingOff(transcriptSanitized)) {
 					appendThinkingOffEntry(entries);
 					thinkingOverride = "off";
 				}
@@ -250,7 +258,8 @@ export function createForkContextResolver(
 				fs.writeFileSync(sessionFile, `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 			} else {
 				const entries = readSessionEntries(sessionFile);
-				if (sanitizeUnsafeThinkingBlocks(entries)) {
+				transcriptSanitized = sanitizeUnsafeThinkingBlocks(entries);
+				if (transcriptSanitized) {
 					if (forceThinkingOff(true)) {
 						appendThinkingOffEntry(entries);
 						thinkingOverride = "off";
@@ -258,7 +267,7 @@ export function createForkContextResolver(
 					fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 				}
 			}
-			const resolution = { sessionFile, ...(thinkingOverride ? { thinkingOverride } : {}) };
+			const resolution = { sessionFile, sanitized: transcriptSanitized, ...(thinkingOverride ? { thinkingOverride } : {}) };
 			cachedResolutions.set(index, resolution);
 			return resolution;
 		} catch (error) {
@@ -288,6 +297,9 @@ export function createForkContextResolver(
 		},
 		thinkingOverrideForIndex(index = 0): "off" | undefined {
 			return resolveFork(index).thinkingOverride;
+		},
+		sanitizedForIndex(index = 0): boolean {
+			return resolveFork(index).sanitized;
 		},
 	};
 }

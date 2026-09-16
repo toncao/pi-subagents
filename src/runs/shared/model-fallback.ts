@@ -1,3 +1,4 @@
+import { forkedChildRequiresThinkingOff } from "../../shared/fork-context.ts";
 import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
@@ -17,6 +18,33 @@ interface ModelAttemptSummary {
 
 export function splitThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
 	return splitKnownThinkingSuffix(model);
+}
+
+/** Pin `:off` onto only the candidates that cannot resume a sanitized fork with thinking.
+ *
+ * A sanitized fork had signed/redacted Anthropic thinking blocks stripped, which only
+ * Anthropic's message API rejects on replay. Forcing the whole candidate chain to `off`
+ * because one fallback is Anthropic silently disables reasoning for unrelated providers,
+ * so mark each candidate individually and leave the rest on their configured level.
+ * The suffix is authoritative at launch and across fallback switches, because
+ * `resolveEffectiveThinking` prefers a candidate's own suffix over the step thinking. */
+export function applyForkThinkingToModel(
+	model: string | undefined,
+	options: { sanitized: boolean; availableModels?: AvailableModelInfo[]; preferredProvider?: string },
+): string | undefined {
+	if (!model) return model;
+	return applyForkThinkingToCandidates([model], options)[0] ?? model;
+}
+
+export function applyForkThinkingToCandidates(
+	candidates: string[],
+	options: { sanitized: boolean; availableModels?: AvailableModelInfo[]; preferredProvider?: string },
+): string[] {
+	if (!options.sanitized) return candidates;
+	return candidates.map((candidate) => {
+		if (!forkedChildRequiresThinkingOff(candidate, options.availableModels, options.preferredProvider)) return candidate;
+		return `${splitKnownThinkingSuffix(candidate).baseModel}:off`;
+	});
 }
 
 /** Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID. */

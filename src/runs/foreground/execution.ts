@@ -75,6 +75,7 @@ import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTr
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
+	applyForkThinkingToCandidates,
 	canContinueSameSessionAfterRateLimit,
 	formatSubagentModelVerificationError,
 	formatModelAttemptNote,
@@ -1853,15 +1854,26 @@ async function runSyncCompletionInner(
 	systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: skillCwd, agentName });
 	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, options.outputPath, agent);
 
-	const candidates = buildModelCandidates(
-		options.modelOverride ?? agent.model,
-		agent.fallbackModels,
-		options.availableModels,
-		agent.modelProvider ?? options.preferredModelProvider,
+	// A sanitized fork only blocks Anthropic replay, so pin `:off` onto those
+	// candidates and let every other candidate keep its configured thinking.
+	// Downstream `applyThinkingSuffix` calls pass replaceExisting=false unless a
+	// chain-wide override exists, so these pins survive to launch and fallback.
+	const candidates = applyForkThinkingToCandidates(
+		buildModelCandidates(
+			options.modelOverride ?? agent.model,
+			agent.fallbackModels,
+			options.availableModels,
+			agent.modelProvider ?? options.preferredModelProvider,
+			{
+				scope: options.modelScope,
+				primaryModelFromParent: options.modelOverrideFromParent,
+				origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
+			},
+		),
 		{
-			scope: options.modelScope,
-			primaryModelFromParent: options.modelOverrideFromParent,
-			origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
+			sanitized: options.forkSanitized === true,
+			availableModels: options.availableModels,
+			preferredProvider: agent.modelProvider ?? options.preferredModelProvider,
 		},
 	);
 	if (options.workflowChildPermitLaunch && candidates.length > 1) {
