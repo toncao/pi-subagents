@@ -323,7 +323,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': expected an object.`);
 	const parsed = value as Record<string, unknown>;
 	const allowedFields = new Set([
-		"modelResponseAliases", "version", "launchContractDigest", "sourceRunId", "agentContract", "agent", "sessionFile", "cwd", "model", "modelProvider", "modelOverrideFromParent", "modelOrigin", "fast", "thinking", "thinkingCeiling", "tools", "allowNestedSubagents", "allowedAgents", "extensions",
+		"modelResponseAliases", "version", "launchContractDigest", "sourceRunId", "agentContract", "agent", "sessionFile", "cwd", "model", "modelProvider", "fallbackModels", "modelOverrideFromParent", "modelOrigin", "fast", "thinking", "thinkingCeiling", "tools", "allowNestedSubagents", "allowedAgents", "extensions",
 		"subagentOnlyExtensions", "mcpDirectTools", "excludeTools", "mutationTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills",
 		"skillPath", "agentFilePath", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
 		"artifactsDir", "maxOutput", "controlConfig", "context", "intercomBridge", "absoluteDeadlineAt", "initialTurnBudget", "initialToolBudget", "maxSubagentDepth", "share", "capabilityCeiling",
@@ -376,7 +376,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		catch (error) { throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${error instanceof Error ? error.message : String(error)}`); }
 	}
 	if (!Number.isInteger(parsed.maxSubagentDepth) || (parsed.maxSubagentDepth as number) < 0) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': maxSubagentDepth must be a non-negative integer.`);
-	for (const field of ["tools", "excludeTools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "mutationTools", "skills", "skillPath"] as const) {
+	for (const field of ["fallbackModels", "tools", "excludeTools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "mutationTools", "skills", "skillPath"] as const) {
 		const item = parsed[field];
 		if (item !== undefined && (!Array.isArray(item) || item.some((entry) => typeof entry !== "string" || !entry.trim()))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field} must contain non-empty strings.`);
 	}
@@ -614,6 +614,7 @@ export function applySteeringRecoveryAgentConfig(agentConfig: AgentConfig, descr
 		...agentConfig,
 		model: descriptor.model,
 		modelProvider: descriptor.modelProvider,
+		fallbackModels: descriptor.fallbackModels ? [...descriptor.fallbackModels] : undefined,
 		thinking: descriptor.thinking,
 		maxThinking: intersectThinkingCeilings(descriptor.thinkingCeiling, agentConfig.maxThinking),
 		tools: descriptor.tools ? [...descriptor.tools] : undefined,

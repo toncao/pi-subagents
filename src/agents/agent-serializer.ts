@@ -14,6 +14,7 @@ export const KNOWN_FIELDS = new Set([
 	"allowNestedSubagents",
 	"allowedAgents",
 	"model",
+	"fallbackModels",
 	"fast",
 	"thinking",
 	"systemPromptMode",
@@ -84,6 +85,8 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
+	const fallbackModelsValue = joinComma(config.fallbackModels);
+	if (fallbackModelsValue || preserve("fallbackModels")) lines.push(`fallbackModels: ${fallbackModelsValue ?? ""}`);
 	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
 	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
 		lines.push(`thinking: ${config.thinking ?? ""}`);

@@ -13,9 +13,12 @@ import type { MockPi } from "../support/helpers.ts";
 import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+import { SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../../src/runs/shared/model-resolution.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -186,6 +189,86 @@ describe("in-process foreground child", () => {
 		assert.equal(result.finalOutput, "finished");
 		assert.equal(mockPi.sessions[0]?.settled, true);
 		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("continues a live session across an exact-model account limit without replaying a completed mutation", async () => {
+		const target = path.join(tempDir, "mutated-once.txt");
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+		mockPi.onCall({
+			writeFiles: [{ path: target, content: "once" }],
+			jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "write-1", name: "write", arguments: { path: target, content: "once" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+				{ type: "tool_execution_start", toolCallId: "write-1", toolName: "write", args: { path: target, content: "once" } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "write-1", toolName: "write", isError: false, content: [{ type: "text", text: "wrote once" }] } },
+				{ type: "tool_execution_end", toolCallId: "write-1", toolName: "write" },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+			],
+		});
+		mockPi.onCall({ output: "continued from the prior tool result" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "anthropic/claude-sonnet-4",
+			fallbackModels: ["anthropic-2/claude-sonnet-4", "openai/gpt-5-mini"],
+		})], "worker", "Write exactly once", {
+			runId: "same-session-account-continuation",
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(fs.readFileSync(target, "utf8"), "once");
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, ["anthropic-2/claude-sonnet-4"]);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(result.progressSummary?.toolCount, 1);
+		assert.deepEqual(result.attemptedModels, ["anthropic/claude-sonnet-4", "anthropic-2/claude-sonnet-4"]);
+		assert.deepEqual(result.modelAttempts?.map(({ model, success }) => ({ model, success })), [
+			{ model: "anthropic/claude-sonnet-4", success: false },
+			{ model: "anthropic-2/claude-sonnet-4", success: true },
+		]);
+	});
+
+	it("uses the same no-replay continuation seam in the detached child driver", async () => {
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "state.txt" } }], model: "openai-codex/gpt-5.4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "state.txt" } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false, content: [{ type: "text", text: "prior result" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-1", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "openai-codex/gpt-5.4", stopReason: "error", errorMessage: "quota exhausted", usage } },
+		] });
+		mockPi.onCall({ output: "continued asynchronously" });
+		const launch = buildInProcessChildLaunch({
+			sessionEnabled: false,
+			model: "openai-codex/gpt-5.4",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			cwd: tempDir,
+			childAgentName: "worker",
+			childIndex: 0,
+			host: "runner",
+		});
+		const result = await runChildSession({
+			factory: childSessionFactory(),
+			launch,
+			prompt: "Task: inspect state once",
+			appendChildEvent: () => {},
+			writeOutputLine: () => {},
+			expectedModelForVerification: "openai-codex/gpt-5.4",
+			accountFallbackCandidates: ["openai-codex-2/gpt-5.4"],
+			modelVerificationRegistry: [
+				{ provider: "openai-codex", id: "gpt-5.4", fullId: "openai-codex/gpt-5.4" },
+				{ provider: "openai-codex-2", id: "gpt-5.4", fullId: "openai-codex-2/gpt-5.4" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.toolCount, 1);
+		assert.deepEqual(result.sameSessionAccountFallback?.attemptedCandidates, ["openai-codex/gpt-5.4", "openai-codex-2/gpt-5.4"]);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(result.messages.some((message) => message.role === "toolResult" && (message as { toolCallId?: string }).toolCallId === "read-1"), true);
 	});
 
 	it("reports the run only after the child session's shutdown work finished", async () => {

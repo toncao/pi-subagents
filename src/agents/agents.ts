@@ -60,6 +60,8 @@ export interface BuiltinAgentOverrideBase {
 	defaultReads?: string[];
 	model?: string;
 	modelProvider?: string;
+	/** Ordered exact-model account aliases eligible for same-session continuation. */
+	fallbackModels?: string[];
 	fast?: boolean;
 	thinking?: string | false;
 	systemPromptMode: SystemPromptMode;
@@ -91,6 +93,7 @@ interface BuiltinAgentOverrideConfig {
 	defaultReads?: string[] | false;
 	model?: string | false;
 	defaultProvider?: string | false;
+	fallbackModels?: string[] | false;
 	fast?: boolean;
 	thinking?: string | false;
 	systemPromptMode?: SystemPromptMode;
@@ -146,6 +149,8 @@ export interface AgentConfig {
 	mcpDirectTools?: string[];
 	model?: string;
 	modelProvider?: string;
+	/** Ordered exact-model account aliases eligible for same-session continuation. */
+	fallbackModels?: string[];
 	fast?: boolean;
 	thinking?: string | false;
 	systemPromptMode: SystemPromptMode;
@@ -775,6 +780,7 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		...(agent.defaultReads !== undefined ? { defaultReads: [...agent.defaultReads] } : {}),
 		...(agent.model !== undefined ? { model: agent.model } : {}),
 		...(agent.modelProvider !== undefined ? { modelProvider: agent.modelProvider } : {}),
+		...(agent.fallbackModels ? { fallbackModels: [...agent.fallbackModels] } : {}),
 		...(agent.fast !== undefined ? { fast: agent.fast } : {}),
 		...(agent.thinking !== undefined ? { thinking: agent.thinking } : {}),
 		systemPromptMode: agent.systemPromptMode,
@@ -808,6 +814,7 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 		...(override.defaultReads !== undefined ? { defaultReads: override.defaultReads === false ? false : [...override.defaultReads] } : {}),
 		...(override.model !== undefined ? { model: override.model } : {}),
 		...(override.defaultProvider !== undefined ? { defaultProvider: override.defaultProvider } : {}),
+		...(override.fallbackModels !== undefined ? { fallbackModels: override.fallbackModels === false ? false : [...override.fallbackModels] } : {}),
 		...(override.fast !== undefined ? { fast: override.fast } : {}),
 		...(override.thinking !== undefined ? { thinking: override.thinking } : {}),
 		...(override.systemPromptMode !== undefined ? { systemPromptMode: override.systemPromptMode } : {}),
@@ -997,9 +1004,6 @@ function parseBuiltinOverrideEntry(
 	}
 
 	const input = value as Record<string, unknown>;
-	if (Object.hasOwn(input, "fallbackModels")) {
-		throw new Error(`Builtin override '${name}' in '${filePath}' uses removed field 'fallbackModels'; configure one model instead.`);
-	}
 	const override: BuiltinAgentOverrideConfig = {};
 
 	if ("description" in input) {
@@ -1118,7 +1122,8 @@ function parseBuiltinOverrideEntry(
 
 	const defaultReads = parseOverrideStringArrayOrFalse(input.defaultReads, { filePath, name, field: "defaultReads" });
 	if (defaultReads !== undefined) override.defaultReads = defaultReads;
-
+	const fallbackModels = parseOverrideStringArrayOrFalse(input.fallbackModels, { filePath, name, field: "fallbackModels" });
+	if (fallbackModels !== undefined) override.fallbackModels = fallbackModels;
 
 	if ("defaultProvider" in input) {
 		if (input.defaultProvider === false) override.defaultProvider = false;
@@ -1470,6 +1475,10 @@ function applyBuiltinOverride(
 		if (override.defaultProvider === false) delete next.modelProvider;
 		else next.modelProvider = override.defaultProvider;
 	}
+	if (override.fallbackModels !== undefined) {
+		if (override.fallbackModels === false) delete next.fallbackModels;
+		else next.fallbackModels = [...override.fallbackModels];
+	}
 	if (override.fast !== undefined) next.fast = override.fast;
 	if (override.thinking !== undefined) { if (override.thinking === false) delete next.thinking; else next.thinking = override.thinking; }
 	if (override.systemPromptMode !== undefined) next.systemPromptMode = override.systemPromptMode;
@@ -1600,6 +1609,7 @@ function runtimeAgentOverrides(settings: SubagentSettings): SubagentSettings {
 		const narrowed: BuiltinAgentOverrideConfig = {};
 		if (override.model !== undefined) narrowed.model = override.model;
 		if (override.defaultProvider !== undefined) narrowed.defaultProvider = override.defaultProvider;
+		if (override.fallbackModels !== undefined) narrowed.fallbackModels = override.fallbackModels;
 		if (override.fast !== undefined) narrowed.fast = override.fast;
 		if (override.thinking !== undefined) narrowed.thinking = override.thinking;
 		if (Object.keys(narrowed).length > 0) overrides[name] = narrowed;
@@ -1629,7 +1639,7 @@ export function applyRuntimeAgentSettings(agents: AgentConfig[], context: Runtim
 
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "modelProvider" | "fast" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "allowNestedSubagents" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "mutationTools" | "toolBudget"> & Partial<Pick<AgentConfig, "description" | "machine" | "output" | "outputMode" | "defaultReads" | "excludeTools">>,
+	draft: Pick<AgentConfig, "model" | "modelProvider" | "fallbackModels" | "fast" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritGlobalContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "allowNestedSubagents" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "mutationTools" | "toolBudget"> & Partial<Pick<AgentConfig, "description" | "machine" | "output" | "outputMode" | "defaultReads" | "excludeTools">>,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 	if (draft.machine !== base.machine) override.machine = draft.machine ?? false;
@@ -1643,6 +1653,7 @@ export function buildBuiltinOverrideConfig(
 	if (!arraysEqual(draft.defaultReads, base.defaultReads)) override.defaultReads = draft.defaultReads ? [...draft.defaultReads] : false;
 	if (draft.model !== base.model) override.model = draft.model ?? false;
 	if (draft.modelProvider !== base.modelProvider) override.defaultProvider = draft.modelProvider ?? false;
+	if (!arraysEqual(draft.fallbackModels, base.fallbackModels)) override.fallbackModels = draft.fallbackModels ? [...draft.fallbackModels] : false;
 	if (draft.fast !== base.fast) override.fast = draft.fast === true;
 	if (draft.thinking !== base.thinking) override.thinking = draft.thinking ?? false;
 	if (draft.systemPromptMode !== base.systemPromptMode) override.systemPromptMode = draft.systemPromptMode;
@@ -2124,7 +2135,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 		const skillStr = frontmatter.skill || frontmatter.skills;
 		const skills = parseFrontmatterList(skillStr);
 		const skillPath = parseFrontmatterList(frontmatter.skillPath);
-		if (frontmatter.fallbackModels !== undefined) throw new Error(`Agent '${filePath}' uses removed frontmatter field 'fallbackModels'. Configure one model instead.`);
+		const fallbackModels = parseFrontmatterList(frontmatter.fallbackModels);
 		const systemPromptMode = frontmatter.systemPromptMode === "replace"
 			? "replace"
 			: frontmatter.systemPromptMode === "append"
@@ -2246,6 +2257,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			...(allowedAgents !== undefined ? { allowedAgents } : {}),
 			...(mcpDirectTools.length > 0 ? { mcpDirectTools } : {}),
 			...(frontmatter.model !== undefined ? { model: frontmatter.model } : {}),
+			...(fallbackModels?.length ? { fallbackModels } : {}),
 			...(fast !== undefined ? { fast } : {}),
 			...(frontmatter.thinking !== undefined ? { thinking: frontmatter.thinking === "false" ? false : frontmatter.thinking } : {}),
 			systemPromptMode,

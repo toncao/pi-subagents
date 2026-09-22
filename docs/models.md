@@ -13,7 +13,7 @@ Builtin agents inherit your current Pi default model. This keeps new installs fr
 
 Precedence, strongest first: per-run override → provider-scoped role override → `agentOverrides.<name>.model` → agent frontmatter `model` → `subagents.defaultModel` → the parent session model. A provider preference does not replace this order; it only resolves bare model ids when the active registry has more than one match. Fully qualified `provider/model` strings still win exactly.
 
-Each launch resolves one model. Provider errors, including HTTP 429 responses, are returned from that model rather than selecting another one. Separately, a verified compaction abort after useful progress may continue the retained child session once on the same resolved model; this lifecycle recovery preserves work and is not model fallback.
+Each launch resolves one primary model. This fork also accepts an ordered `fallbackModels` list on agent frontmatter, runtime definitions, profiles, and `subagents.agentOverrides.<name>`, but uses it only for guarded same-session account continuation: the fallback must resolve to an account alias for the exact same model. Cross-provider or different-model entries are not launched automatically. Separately, a verified compaction abort after useful progress may continue the retained child session once on the already resolved model.
 
 Use `model: "inherit"` in agent frontmatter or `agentOverrides.<name>.model` to select the current parent session model explicitly.
 
@@ -29,7 +29,8 @@ In `~/.pi/agent/settings.json` (user) or the project config settings file (`.pi/
     "defaultProvider": "gpu-a",
     "agentOverrides": {
       "oracle": {
-        "model": "deepseek-v4-pro"
+        "model": "anthropic/claude-fable-5",
+        "fallbackModels": ["anthropic-2/claude-fable-5"]
       },
       "worker": {
         "defaultProvider": "gpu-b"
@@ -82,7 +83,7 @@ For a persistent role override:
 }
 ```
 
-`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, project, and runtime-registered agents. `defaultModel` fills only agents that do not set `model` in frontmatter or in their runtime definition. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` win over frontmatter and the global default. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable an agent (see [agents.md](agents.md)); matching custom-agent frontmatter is replaced for any field set by the override. Runtime-registered agents take only `model`, `defaultProvider`, `fast`, and `thinking` from `agentOverrides.<name>`; their other definition fields stay owned by the registering extension.
+`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, project, and runtime-registered agents. `defaultModel` fills only agents that do not set `model` in frontmatter or in their runtime definition. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` win over frontmatter and the global default. The same `agentOverrides` block can change `fallbackModels`, `tools`, `skills`, inherited context, prompt text, or disable an agent (see [agents.md](agents.md)); matching custom-agent frontmatter is replaced for any field set by the override. Runtime-registered agents take `model`, `defaultProvider`, `fallbackModels`, `fast`, and `thinking` from `agentOverrides.<name>`; their other definition fields stay owned by the registering extension.
 
 ## Fast mode
 
@@ -101,9 +102,9 @@ A setup that works well in practice: route agents by task shape instead of runni
 
 The routing rule: use the capability tiers (1–3) when the task is well-scoped, and the intent tier (4) when scoping or judging is the task itself.
 
-Each launch resolves one model and starts the child once. Provider, authentication, quota, rate-limit, stream, empty-response, context-overflow, and provisioning failures are returned from that attempt. To try another model, the parent or operator must issue a later explicit launch.
+Each launch resolves one primary model and starts one child session. Provider, authentication, stream, empty-response, context-overflow, and provisioning failures are returned from that attempt; this fork does not replay the task in a fresh child or switch to a different model/provider automatically.
 
-After a child has completed tools, runtime rate/quota recovery is narrower than ordinary fallback: it can continue only in the same live child session, only to another account alias for the exact same model, and only when the tool-call history is fully paired and successful. Cancellation, an active tool, exhausted run/tool budgets, structured output, a different model, or an untrusted/non-terminal error disables continuation. The child receives a short continuation notice over its retained transcript and tool results; the original `Task:` is not replayed. The default model-exclusion TTL remains 24 hours. When the optional `pi-multi-account` companion publishes provider-availability evidence newer than a recorded rate/quota failure, that evidence can clear the still-unexpired exclusion; absent, stale, or pre-failure evidence leaves the exclusion in force.
+After a child has completed tools, runtime rate/quota recovery is deliberately narrower: it can continue only in that same live child session, only to a configured account alias for the exact same model, and only when the tool-call history is fully paired and successful. Cancellation, an active tool, exhausted run/tool budgets, structured output, a different model, a different provider family (for example `openai` to `azure-openai-responses`), or an untrusted/non-terminal error disables continuation. The child receives a short continuation notice over its retained transcript and tool results; the original `Task:` is not replayed. Results expose `attemptedModels` and per-attempt terminal accounting when continuation occurred. Remote Herdr sessions currently fail closed because their bridge does not implement live model switching.
 
 ## Thinking level defaults
 

@@ -458,7 +458,18 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 			else delete target.model;
 		} else return "config.model must be a string or false when provided.";
 	}
-	if (hasKey(cfg, "fallbackModels")) return "config.fallbackModels was removed; configure one model instead.";
+	if (hasKey(cfg, "fallbackModels")) {
+		if (cfg.fallbackModels === false || cfg.fallbackModels === "") delete target.fallbackModels;
+		else if (typeof cfg.fallbackModels === "string") {
+			const fallbackModels = parseCsv(cfg.fallbackModels);
+			if (fallbackModels.length) target.fallbackModels = [...new Set(fallbackModels)];
+			else delete target.fallbackModels;
+		} else if (Array.isArray(cfg.fallbackModels) && cfg.fallbackModels.every((entry) => typeof entry === "string")) {
+			const fallbackModels = [...new Set(cfg.fallbackModels.map((entry) => entry.trim()).filter(Boolean))];
+			if (fallbackModels.length) target.fallbackModels = fallbackModels;
+			else delete target.fallbackModels;
+		} else return "config.fallbackModels must be a comma-separated string, string array, or false when provided.";
+	}
 	if (hasKey(cfg, "tools")) {
 		if (cfg.tools === false || cfg.tools === "") { delete target.tools; delete target.mcpDirectTools; }
 		else if (typeof cfg.tools === "string") {

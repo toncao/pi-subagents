@@ -145,7 +145,7 @@ describe("profiles helpers", () => {
 		assert.equal(agents.some((agent) => agent.source === "builtin"), false);
 	});
 
-	it("rejects removed profile fallback models", () => {
+	it("rejects malformed profile fallback models", () => {
 		const profilesDir = getSubagentProfilesDir();
 		fs.mkdirSync(profilesDir, { recursive: true });
 		fs.writeFileSync(path.join(profilesDir, "invalid.json"), JSON.stringify({
@@ -156,7 +156,7 @@ describe("profiles helpers", () => {
 			},
 		}, null, 2));
 
-		assert.throws(() => applySubagentProfile("invalid"), /removed field fallbackModels/);
+		assert.throws(() => applySubagentProfile("invalid"), /invalid fallbackModels/);
 	});
 
 	it("rejects profile and provider path traversal names", async () => {

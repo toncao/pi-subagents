@@ -22,6 +22,7 @@ import {
 	type ControlEvent,
 	type RunSyncOptions,
 	type SingleResult,
+	type ModelAttempt,
 	type Usage,
 	DEFAULT_MAX_OUTPUT,
 	INTERCOM_DETACH_REQUEST_EVENT,
@@ -70,9 +71,13 @@ import { planAbortRecovery } from "../shared/abort-recovery.ts";
 import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
+	applyForkThinkingToCandidates,
+	canContinueSameSessionAfterRateLimit,
 	formatSubagentModelVerificationError,
 	isContextOverflow,
 	resolveModelSelection,
+	resolveSameModelAccountFallbacks,
+	SAME_SESSION_ACCOUNT_FALLBACK_NOTICE,
 } from "../shared/model-resolution.ts";
 import {
 	createMutatingFailureState,
@@ -134,6 +139,17 @@ function sumUsage(target: Usage, source: Usage): void {
 	target.turns += source.turns;
 }
 
+function usageSince(current: Usage, previous: Usage): Usage {
+	return {
+		input: current.input - previous.input,
+		output: current.output - previous.output,
+		cacheRead: current.cacheRead - previous.cacheRead,
+		cacheWrite: current.cacheWrite - previous.cacheWrite,
+		cost: current.cost - previous.cost,
+		turns: current.turns - previous.turns,
+	};
+}
+
 function persistSingleResultMetadata(input: {
 	metadataPath?: string;
 	enabled: boolean;
@@ -153,6 +169,8 @@ function persistSingleResultMetadata(input: {
 		usage: target.usage,
 		model: target.model,
 		requestedModel: target.requestedModel,
+		attemptedModels: target.attemptedModels,
+		modelAttempts: target.modelAttempts,
 		durationMs: target.progressSummary?.durationMs,
 		toolCount: target.progressSummary?.toolCount,
 		error: target.error,
@@ -251,6 +269,8 @@ function snapshotResult(result: SingleResult, progress: AgentProgress): SingleRe
 		task: PROMPT_REDACTED,
 		messages: result.outputMode === "file-only" && result.savedOutputPath ? undefined : result.messages ? [...result.messages] : undefined,
 		usage: { ...result.usage },
+		attemptedModels: result.attemptedModels ? [...result.attemptedModels] : undefined,
+		modelAttempts: result.modelAttempts ? result.modelAttempts.map((attempt) => ({ ...attempt, usage: attempt.usage ? { ...attempt.usage } : undefined })) : undefined,
 		skills: result.skills ? [...result.skills] : undefined,
 		controlEvents: result.controlEvents ? result.controlEvents.map((event) => ({ ...event })) : undefined,
 		progress,
@@ -334,7 +354,11 @@ function isCompleteUsageCounter(value: unknown): value is number {
 const STOPPED_BEFORE_COMPLETION_ERROR = "Subagent stopped before completion.";
 const AFTER_COMPACTION_SETTLEMENT = Symbol("afterCompactionSettlement");
 type AbortRecoverySingleResult = SingleResult & { [AFTER_COMPACTION_SETTLEMENT]?: true };
-
+interface SameSessionAccountFallback {
+	attemptedCandidates: string[];
+	failedAttempts: Array<ModelAttempt & { success: false; exitCode: 1; error: string; usage: Usage }>;
+}
+const sameSessionAccountFallbackByResult = new WeakMap<SingleResult, SameSessionAccountFallback>();
 
 async function runSingleAttempt(
 	runtimeCwd: string,
@@ -357,12 +381,18 @@ async function runSingleAttempt(
 		orcaProgressTab?: OrcaProgressTab;
 		launchWarnings: { emitted: boolean };
 		verifyModel: boolean;
+		/** Ordered, resolved same-model aliases after this launch model. */
+		accountFallbackCandidates?: readonly string[];
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
 	assertThinkingWithinCeiling({ model: modelArg, configThinking: effectiveThinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
-	const expectedModelForVerification = shared.verifyModel ? modelArg : undefined;
+	let expectedModelForVerification = shared.verifyModel ? modelArg : undefined;
+	let selectedCandidate = modelArg;
+	const attemptedAccountCandidates = selectedCandidate ? [selectedCandidate] : [];
+	const failedAccountAttempts: SameSessionAccountFallback["failedAttempts"] = [];
+	let accountAttemptUsageStart = emptyUsage();
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
 	// Display name for the child session: applied inside the child through its
 	// runtime config and echoed back on the result payload so hosts can label
@@ -1407,7 +1437,48 @@ async function runSingleAttempt(
 				}
 				options.onChildSession?.({ steer: (text) => created.steer(text), followUp: (text) => created.followUp(text) });
 				messageBaseline = created.messages.length;
-				await created.prompt(`Task: ${task}`);
+				let prompt = `Task: ${task}`;
+				let fallbackIndex = 0;
+				for (;;) {
+					await created.prompt(prompt);
+					const nextCandidate = shared.accountFallbackCandidates?.[fallbackIndex];
+					if (!canContinueSameSessionAfterRateLimit({
+						currentModel: selectedCandidate,
+						nextModel: nextCandidate,
+						error: result.error ?? assistantError,
+						messages: result.messages,
+						toolCount: progress.toolCount,
+						currentTool: progress.currentTool,
+						cancelled: abortedBySignal || interruptedByControl || result.timedOut || result.stopped,
+						budgetExhausted: result.toolBudgetBlocked,
+						structuredOutputInvoked: structuredOutputToolInvoked,
+					})) break;
+					const failure = (result.error ?? assistantError)!;
+					const failedUsage = usageSince(result.usage, accountAttemptUsageStart);
+					clearFinalDrainTimers();
+					clearWatchdogTailTimer();
+					appendRecentOutput(progress, [`[fallback] ${selectedCandidate} reached a runtime rate/quota limit. Continuing the same session with ${nextCandidate}.`]);
+					await created.switchModel(nextCandidate!);
+					if (abortedBySignal || interruptedByControl || result.timedOut || result.stopped) break;
+					failedAccountAttempts.push({ model: selectedCandidate!, success: false, exitCode: 1, error: failure, usage: failedUsage });
+					accountAttemptUsageStart = { ...result.usage };
+					fallbackIndex++;
+					selectedCandidate = nextCandidate;
+					expectedModelForVerification = nextCandidate;
+					attemptedAccountCandidates.push(nextCandidate!);
+					result.model = nextCandidate;
+					progress.model = nextCandidate;
+					result.error = undefined;
+					assistantError = undefined;
+					cleanTerminalAssistantStopReceived = false;
+					agentSettledReceived = false;
+					compactionStartedReceived = false;
+					afterCompactionSettlement = false;
+					forcedTermination = false;
+					childLifecycleState.compactionRetryActive = false;
+					prompt = SAME_SESSION_ACCOUNT_FALLBACK_NOTICE;
+					fireUpdate();
+				}
 				settle(undefined);
 			} catch (error) {
 				settle(error ?? new Error("Child session failed."));
@@ -1415,6 +1486,9 @@ async function runSingleAttempt(
 		})();
 	});
 	result.exitCode = exitCode;
+	if (failedAccountAttempts.length > 0) {
+		sameSessionAccountFallbackByResult.set(result, { attemptedCandidates: attemptedAccountCandidates, failedAttempts: failedAccountAttempts });
+	}
 	if (afterCompactionSettlement) {
 		(result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT] = true;
 	}
@@ -1747,9 +1821,15 @@ async function runSyncCompletionInner(
 			origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
 		},
 	);
+	const accountFallbackCandidates = applyForkThinkingToCandidates(
+		resolveSameModelAccountFallbacks(selectedModel, agent.fallbackModels, options.availableModels, agent.modelProvider ?? options.preferredModelProvider),
+		{ sanitized: options.forkSanitized === true, availableModels: options.availableModels, preferredProvider: agent.modelProvider ?? options.preferredModelProvider },
+	).map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
+		.filter((candidate): candidate is string => Boolean(candidate));
 	try {
-		const model = applyThinkingSuffix(selectedModel, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined);
-		assertThinkingWithinCeiling({ model, configThinking: options.thinkingOverride ?? agent.thinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
+		for (const model of [applyThinkingSuffix(selectedModel, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined), ...accountFallbackCandidates]) {
+			assertThinkingWithinCeiling({ model, configThinking: options.thinkingOverride ?? agent.thinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
+		}
 	} catch (error) {
 		return redactResultPrompt(withRunContext({
 			index: options.index ?? 0,
@@ -1867,6 +1947,7 @@ async function runSyncCompletionInner(
 			orcaProgressTab,
 			launchWarnings,
 			verifyModel,
+			accountFallbackCandidates,
 		});
 		lastResult = attemptResult;
 		sumUsage(aggregateUsage, attemptResult.usage);
@@ -1900,6 +1981,23 @@ async function runSyncCompletionInner(
 		break;
 	}
 	if (!lastResult) throw new Error("Subagent did not produce a result.");
+	const accountFallback = sameSessionAccountFallbackByResult.get(lastResult);
+	if (accountFallback) {
+		lastResult.attemptedModels = [...accountFallback.attemptedCandidates];
+		lastResult.modelAttempts = [
+			...accountFallback.failedAttempts,
+			{
+				model: accountFallback.attemptedCandidates.at(-1) ?? lastResult.model ?? selectedModel ?? "default",
+				success: lastResult.exitCode === 0 && !lastResult.error,
+				exitCode: lastResult.exitCode,
+				...(lastResult.error ? { error: lastResult.error } : {}),
+				usage: usageSince(lastResult.usage, accountFallback.failedAttempts.reduce((total, attempt) => {
+					sumUsage(total, attempt.usage);
+					return total;
+				}, emptyUsage())),
+			},
+		];
+	}
 	if (isContextOverflow(lastResult.error)) lastResult.contextOverflow = true;
 
 	const result = withRunContext(lastResult ?? {

@@ -55,6 +55,7 @@ import {
 	type HerdrMachineReference,
 	DEFAULT_MAX_OUTPUT,
 	type MaxOutputConfig,
+	type ModelAttempt,
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 	truncateOutput,
 } from "../../shared/types.ts";
@@ -258,6 +259,8 @@ interface StepResult {
 	sessionFile?: string;
 	intercomTarget?: string;
 	model?: string;
+	attemptedModels?: string[];
+	modelAttempts?: ModelAttempt[];
 	nativeMachine?: import("../../shared/types.ts").SingleResult["nativeMachine"];
 	thinking?: string;
 	requestedModel?: string;
@@ -407,6 +410,27 @@ function findLatestSessionFile(sessionDir: string): string | null {
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+}
+
+function usageAfterAttempts(total: Usage, attempts: readonly ModelAttempt[]): Usage {
+	const used = emptyUsage();
+	for (const attempt of attempts) {
+		if (!attempt.usage) continue;
+		used.input += attempt.usage.input;
+		used.output += attempt.usage.output;
+		used.cacheRead += attempt.usage.cacheRead;
+		used.cacheWrite += attempt.usage.cacheWrite;
+		used.cost += attempt.usage.cost;
+		used.turns += attempt.usage.turns;
+	}
+	return {
+		input: total.input - used.input,
+		output: total.output - used.output,
+		cacheRead: total.cacheRead - used.cacheRead,
+		cacheWrite: total.cacheWrite - used.cacheWrite,
+		cost: total.cost - used.cost,
+		turns: total.turns - used.turns,
+	};
 }
 
 function tokenUsageFromUsage(usage: Usage | undefined): TokenUsage | null {
@@ -1218,9 +1242,11 @@ export async function runSingleStepInner(
 			toolTimeoutMs: ctx.toolTimeoutMs,
 			runDeadlineAt: ctx.deadlineAt,
 			expectedModelForVerification,
+			accountFallbackCandidates: step.accountFallbackModels,
 			modelVerificationRegistry: step.modelVerificationRegistry,
 			modelResponseAliases: step.modelResponseAliases,
 			mutationTools: step.mutationTools,
+			usageBudgetExhausted: ctx.usageBudgetExhausted,
 		}));
 		launched = true;
 		aggregateUsage.input += run.usage.input;
@@ -1316,6 +1342,22 @@ export async function runSingleStepInner(
 					: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
 				: undefined);
 		const error = underlyingError ?? missingRequiredOutputError;
+		const accountFallback = run.sameSessionAccountFallback;
+		delete run.sameSessionAccountFallback;
+		const selectedCandidate = accountFallback?.attemptedCandidates.at(-1) ?? run.model ?? candidate;
+		if (accountFallback) {
+			run.attemptedModels = [...accountFallback.attemptedCandidates];
+			run.modelAttempts = [
+				...accountFallback.failedAttempts,
+				{
+					model: selectedCandidate ?? "default",
+					success: effectiveExitCode === 0 && !error,
+					exitCode: effectiveExitCode,
+					...(error ? { error } : {}),
+					usage: usageAfterAttempts(run.usage, accountFallback.failedAttempts),
+				},
+			];
+		}
 		finalOutputSnapshot = outputSnapshot;
 		if (step.toolBudget) {
 			const toolMessages = run.messages.filter((message) => message.role === "toolResult");
@@ -1330,7 +1372,7 @@ export async function runSingleStepInner(
 			afterCompactionSettlement: run.afterCompactionSettlement === true,
 		} : undefined;
 		const fileMutationEffect = missingRequiredOutputAfterMutation ? { status: "observed" as const, attempted: true as const, evidence: mutationEvidence } : undefined;
-		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
+		finalResult = { ...run, exitCode: effectiveExitCode, model: selectedCandidate, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
 		if (run.stopped || run.timedOut || ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break singleLaunch;
 		if (effectiveExitCode === 0 && !error) break singleLaunch;
 		const recovery = planAbortRecovery({
@@ -1488,6 +1530,8 @@ export async function runSingleStepInner(
 				task: PROMPT_REDACTED,
 				exitCode: effectiveFinalExitCode,
 				model: finalResult?.model,
+				attemptedModels: finalResult?.attemptedModels,
+				modelAttempts: finalResult?.modelAttempts,
 				nativeMachine: finalResult?.nativeMachine,
 				requestedModel: step.requestedModel,
 				usage,
@@ -1518,6 +1562,8 @@ export async function runSingleStepInner(
 		sessionFile: step.sessionFile,
 		intercomTarget: ctx.childIntercomTarget,
 		model: finalResult?.model,
+		attemptedModels: finalResult?.attemptedModels,
+		modelAttempts: finalResult?.modelAttempts,
 		nativeMachine: finalResult?.nativeMachine,
 		thinking: resolveEffectiveThinking(finalResult?.model, step.thinking),
 		requestedModel: step.requestedModel,
@@ -3752,6 +3798,8 @@ export async function runSubagent(
 				if (singleResult.toolBudgetBlocked) statusPayload.toolBudgetBlocked = true;
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "sessionName", singleResult.sessionName);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "model", singleResult.model);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "attemptedModels", singleResult.attemptedModels);
+				setOptionalProperty(requiredStatusStep(statusPayload, fi), "modelAttempts", singleResult.modelAttempts);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "thinking", resolveEffectiveThinking(singleResult.model, requiredStatusStep(statusPayload, fi).thinking));
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "requestedModel", singleResult.requestedModel);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "contextOverflow", singleResult.contextOverflow);
@@ -3821,6 +3869,8 @@ export async function runSubagent(
 					sessionFile: pr.sessionFile,
 					intercomTarget: pr.intercomTarget,
 					model: pr.model,
+					attemptedModels: pr.attemptedModels,
+					modelAttempts: pr.modelAttempts,
 					thinking: pr.thinking,
 					requestedModel: pr.requestedModel,
 					contextOverflow: pr.contextOverflow,
@@ -4266,6 +4316,8 @@ export async function runSubagent(
 						sessionFile: pr.sessionFile,
 						intercomTarget: pr.intercomTarget,
 						model: pr.model,
+						attemptedModels: pr.attemptedModels,
+						modelAttempts: pr.modelAttempts,
 						thinking: pr.thinking,
 						requestedModel: pr.requestedModel,
 						contextOverflow: pr.contextOverflow,
@@ -4563,6 +4615,8 @@ export async function runSubagent(
 				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
+				attemptedModels: singleResult.attemptedModels,
+				modelAttempts: singleResult.modelAttempts,
 				thinking: singleResult.thinking,
 				requestedModel: singleResult.requestedModel,
 				contextOverflow: singleResult.contextOverflow,
@@ -4957,6 +5011,8 @@ export async function runSubagent(
 				sessionFile: r.sessionFile,
 				intercomTarget: r.intercomTarget,
 				model: r.model,
+				attemptedModels: r.attemptedModels,
+				modelAttempts: r.modelAttempts,
 				thinking: r.thinking,
 				requestedModel: r.requestedModel,
 				contextOverflow: r.contextOverflow,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+	canContinueSameSessionAfterRateLimit,
 	formatSubagentModelVerificationError,
 	fuzzyResolveModel,
 	isContextOverflow,
@@ -9,6 +10,7 @@ import {
 	resolveEffectiveSubagentModel,
 	resolveModelCandidate,
 	resolveModelSelection,
+	resolveSameModelAccountFallbacks,
 	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-resolution.ts";
 import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
@@ -91,9 +93,55 @@ describe("single model resolution", () => {
 		assert.throws(() => resolveModelSelection("openai/gpt-5-mini", models, undefined, { scope: strict, origin: "inherited" }), /outside the configured subagent model scope/);
 	});
 
+	it("keeps only configured exact-model account aliases for live continuation", () => {
+		const registry = [
+			...models,
+			{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+			{ provider: "anthropic-account-3", id: "claude-sonnet-4", fullId: "anthropic-account-3/claude-sonnet-4" },
+			{ provider: "azure-openai-responses", id: "gpt-5-mini", fullId: "azure-openai-responses/gpt-5-mini" },
+		];
+		assert.deepEqual(resolveSameModelAccountFallbacks(
+			"anthropic/claude-sonnet-4",
+			["anthropic-2/claude-sonnet-4", "openai/gpt-5-mini", "anthropic-account-3/claude-sonnet-4", "missing/model"],
+			registry,
+		), ["anthropic-2/claude-sonnet-4", "anthropic-account-3/claude-sonnet-4"]);
+		assert.deepEqual(resolveSameModelAccountFallbacks(
+			"openai/gpt-5-mini",
+			["azure-openai-responses/gpt-5-mini"],
+			registry,
+		), [], "provider families that merely share a model id are not interchangeable");
+	});
+
 	it("fails closed when enforced inherit has no parent model", () => {
 		const scope = resolveModelScopesForAgent({ allow: ["inherit"], enforce: true }, "worker", undefined);
 		assert.throws(() => resolveModelSelection(undefined, models, undefined, { scope }), /'inherit' requires a current parent session model/);
+	});
+});
+
+describe("same-session continuation admission", () => {
+	const complete = [
+		{ role: "assistant", content: [{ type: "toolCall", id: "write-1" }] },
+		{ role: "toolResult", toolCallId: "write-1", isError: false },
+		{ role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit" },
+	];
+	const base = {
+		currentModel: "anthropic/claude-sonnet-4",
+		nextModel: "anthropic-2/claude-sonnet-4",
+		error: "429 rate limit",
+		toolCount: 1,
+	};
+
+	it("admits only a fully paired successful tool history with the trusted terminal error", () => {
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: complete }), true);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: complete.slice(0, 1) }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: [complete[0], { role: "toolResult", toolCallId: "write-1", isError: true }, complete[2]] }), false);
+	});
+
+	it("vetoes cancellation, active tools, budgets, structured output, and cross-provider routes", () => {
+		for (const extra of [{ cancelled: true }, { currentTool: "write" }, { budgetExhausted: true }, { structuredOutputInvoked: true }]) {
+			assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: complete, ...extra }), false);
+		}
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, nextModel: "azure-openai-responses/claude-sonnet-4", messages: complete }), false);
 	});
 });
 

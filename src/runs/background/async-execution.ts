@@ -29,7 +29,7 @@ import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { backgroundProcessOptions } from "../shared/background-process-options.ts";
 import { normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
-import { applyForkThinkingToModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
+import { applyForkThinkingToCandidates, applyForkThinkingToModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSameModelAccountFallbacks, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -1125,6 +1125,14 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 			}
 		}
+		const accountFallbackModels = externalRunner ? [] : resolveSameModelAccountFallbacks(
+			selectedModel,
+			a.fallbackModels,
+			availableModels,
+			a.modelProvider,
+		).map((candidate) => applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined))
+			.filter((candidate): candidate is string => Boolean(candidate));
+		for (const model of accountFallbackModels) assertThinkingWithinCeiling({ model, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: machine ? runnerCwd : stepCwd, agent: a.name, model: selectedModel, warn: (violation) => sendRuleViolationWarning(ctx.pi, violation) });
 		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
@@ -1171,6 +1179,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			cwd: stepCwd,
 			requestedCwd: machine ? machine.cwd : s.cwd ?? stepCwd,
 			model: selectedModel,
+			...(accountFallbackModels.length ? { accountFallbackModels } : {}),
 			...(contextLimit !== undefined ? { contextLimit } : {}),
 			...(fast !== undefined ? { fast } : {}),
 			thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
@@ -1932,6 +1941,18 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
+	const accountFallbackModels = externalRunner ? [] : applyForkThinkingToCandidates(
+		resolveSameModelAccountFallbacks(selectedModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider),
+		forkThinkingPolicy,
+	).map((candidate) => applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined))
+		.filter((candidate): candidate is string => Boolean(candidate));
+	try {
+		for (const fallbackModel of accountFallbackModels) {
+			assertThinkingWithinCeiling({ model: fallbackModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
+		}
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
 	const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
@@ -1996,6 +2017,7 @@ export function executeAsyncSingle(
 		...(selectedModel ? { model: selectedModel } : {}),
 		...(params.fast ?? recoveryAgentConfig.fast ? { fast: params.fast ?? recoveryAgentConfig.fast } : {}),
 		...(recoveryAgentConfig.modelProvider ? { modelProvider: recoveryAgentConfig.modelProvider } : {}),
+		...(recoveryAgentConfig.fallbackModels?.length ? { fallbackModels: [...recoveryAgentConfig.fallbackModels] } : {}),
 		...(modelOrigin === "inherited" ? { modelOverrideFromParent: true } : {}),
 		modelOrigin,
 		...(effectiveThinking ? { thinking: resolveEffectiveThinking(selectedModel, effectiveThinking) } : {}),
@@ -2066,6 +2088,7 @@ export function executeAsyncSingle(
 						cwd: machine?.cwd ?? runnerCwd,
 						requestedCwd: machine?.cwd ?? params.requestedCwd ?? runnerCwd,
 						model: selectedModel,
+						...(accountFallbackModels.length ? { accountFallbackModels } : {}),
 						...(contextLimit !== undefined ? { contextLimit } : {}),
 						...(params.fast ?? agentConfig.fast ? { fast: params.fast ?? agentConfig.fast } : {}),
 						thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),

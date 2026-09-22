@@ -815,6 +815,7 @@ export interface SteeringRecoveryDescriptor {
 	cwd: string;
 	model?: string;
 	modelProvider?: string;
+	fallbackModels?: string[];
 	modelOverrideFromParent?: boolean;
 	modelOrigin?: "explicit" | "inherited" | "configured";
 	fast?: boolean;
@@ -1241,6 +1242,14 @@ export interface UsageBudgetState {
 	reason?: "tokens" | "costUsd";
 }
 
+export interface ModelAttempt {
+	model: string;
+	success: boolean;
+	exitCode: number;
+	error?: string;
+	usage?: Usage;
+}
+
 export interface SingleResult {
 	/**
 	 * Stable child identity within the foreground run. Pair with Details.runId for
@@ -1274,6 +1283,9 @@ export interface SingleResult {
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
+	/** Ordered live-session account candidates attempted without replaying prior tools. */
+	attemptedModels?: string[];
+	modelAttempts?: ModelAttempt[];
 	/** Authoritative before/after Git evidence captured by a pane-native remote machine. */
 	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus };
 	/** Effective thinking level used by this foreground child, when known. */
@@ -1972,6 +1984,8 @@ export interface AsyncStatus {
 		tokens?: TokenUsage;
 		skills?: string[];
 		model?: string;
+		attemptedModels?: string[];
+		modelAttempts?: ModelAttempt[];
 		thinking?: string;
 		contextLimit?: number;
 		thinkingCeiling?: ThinkingLevel;

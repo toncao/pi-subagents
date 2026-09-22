@@ -19,7 +19,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleState } from "../shared/child-lifecycle.ts";
-import { formatSubagentModelVerificationError } from "../shared/model-resolution.ts";
+import { canContinueSameSessionAfterRateLimit, formatSubagentModelVerificationError, SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../shared/model-resolution.ts";
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
@@ -97,9 +97,13 @@ export interface RunChildSessionInput {
 	toolTimeoutMs?: number;
 	runDeadlineAt?: number;
 	expectedModelForVerification?: string;
+	/** Ordered, resolved exact-model account aliases after the initial model. */
+	accountFallbackCandidates?: readonly string[];
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
 	modelResponseAliases?: Record<string, string[]>;
 	mutationTools?: readonly string[];
+	/** Live run-level budget check; true blocks account continuation. */
+	usageBudgetExhausted?: () => boolean | undefined;
 }
 
 export interface RunChildSessionResult {
@@ -126,6 +130,13 @@ export interface RunChildSessionResult {
 	currentPath?: string;
 	afterCompactionSettlement?: boolean;
 	abortRecoveryDiagnostic?: string;
+	/** Internal runner handoff; consumed before the public result is built. */
+	sameSessionAccountFallback?: {
+		attemptedCandidates: string[];
+		failedAttempts: Array<{ model: string; success: false; exitCode: 1; error: string; usage: Usage }>;
+	};
+	attemptedModels?: string[];
+	modelAttempts?: import("../../shared/types.ts").ModelAttempt[];
 	/** Set by the runner while it finalizes the attempt. */
 	toolBudget?: ToolBudgetState;
 	toolBudgetBlocked?: boolean;
@@ -152,6 +163,17 @@ function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 }
 
+function usageSince(current: Usage, previous: Usage): Usage {
+	return {
+		input: current.input - previous.input,
+		output: current.output - previous.output,
+		cacheRead: current.cacheRead - previous.cacheRead,
+		cacheWrite: current.cacheWrite - previous.cacheWrite,
+		cost: current.cost - previous.cost,
+		turns: current.turns - previous.turns,
+	};
+}
+
 function omitUndefined<T extends object>(value: T): T {
 	for (const key of Object.keys(value) as Array<keyof T>) {
 		if (value[key] === undefined) delete value[key];
@@ -169,6 +191,11 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const messages: Message[] = [];
 		const usage = emptyUsage();
 		let model: string | undefined;
+		let expectedModelForVerification = input.expectedModelForVerification;
+		let selectedCandidate = input.launch.session.model;
+		const attemptedAccountCandidates = selectedCandidate ? [selectedCandidate] : [];
+		const failedAccountAttempts: NonNullable<RunChildSessionResult["sameSessionAccountFallback"]>["failedAttempts"] = [];
+		let accountAttemptUsageStart = emptyUsage();
 		let error: string | undefined;
 		let assistantError: string | undefined;
 		let interrupted = false;
@@ -177,6 +204,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let observedMutationAttempt = false;
 		let structuredOutputToolInvoked = false;
 		let structuredOutputMessageStartIndex: number | undefined;
+		let toolBudgetBlocked = false;
 		let currentTool: string | undefined;
 		let currentToolArgs: string | undefined;
 		let currentPath: string | undefined;
@@ -480,6 +508,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
 				if (event.type === "tool_result_end") {
+					if (extractTextFromContent(event.message.content).includes("Tool budget hard limit reached")) toolBudgetBlocked = true;
 					clearActiveToolTimeout(event);
 					removeActiveToolCall({
 						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,
@@ -508,8 +537,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				const hasToolCall = assistantStartsToolCall(event.message);
 				if (event.message.model) {
 					model = event.message.model;
-					if (input.expectedModelForVerification && !hasToolCall) {
-						const modelVerificationError = formatSubagentModelVerificationError(input.expectedModelForVerification, event.message.model, input.modelVerificationRegistry, input.modelResponseAliases);
+					if (expectedModelForVerification && !hasToolCall) {
+						const modelVerificationError = formatSubagentModelVerificationError(expectedModelForVerification, event.message.model, input.modelVerificationRegistry, input.modelResponseAliases);
 						if (modelVerificationError && !error) error = modelVerificationError;
 					}
 				}
@@ -623,6 +652,10 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					currentToolArgs,
 					currentPath,
 					afterCompactionSettlement: afterCompactionSettlement || undefined,
+					sameSessionAccountFallback: failedAccountAttempts.length > 0 ? {
+						attemptedCandidates: attemptedAccountCandidates,
+						failedAttempts: failedAccountAttempts,
+					} : undefined,
 				});
 				resolve(result);
 			});
@@ -686,7 +719,46 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				});
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
-				await created.prompt(input.prompt);
+				let prompt = input.prompt;
+				let fallbackIndex = 0;
+				for (;;) {
+					await created.prompt(prompt);
+					const nextCandidate = input.accountFallbackCandidates?.[fallbackIndex];
+					if (!canContinueSameSessionAfterRateLimit({
+						currentModel: selectedCandidate,
+						nextModel: nextCandidate,
+						error: error ?? assistantError,
+						messages,
+						toolCount,
+						currentTool,
+						cancelled: interrupted || timedOut || stopped,
+						budgetExhausted: toolBudgetBlocked || input.usageBudgetExhausted?.() === true,
+						structuredOutputInvoked: structuredOutputToolInvoked,
+					})) break;
+					const failure = (error ?? assistantError)!;
+					const failedUsage = usageSince(usage, accountAttemptUsageStart);
+					clearFinalDrainTimers();
+					clearWatchdogTailTimer();
+					input.writeOutputLine(`[fallback] ${selectedCandidate} reached a runtime rate/quota limit. Continuing the same session with ${nextCandidate}.`);
+					await created.switchModel(nextCandidate!);
+					if (interrupted || timedOut || stopped || input.usageBudgetExhausted?.() === true) break;
+					failedAccountAttempts.push({ model: selectedCandidate!, success: false, exitCode: 1, error: failure, usage: failedUsage });
+					accountAttemptUsageStart = { ...usage };
+					fallbackIndex++;
+					selectedCandidate = nextCandidate;
+					expectedModelForVerification = nextCandidate;
+					attemptedAccountCandidates.push(nextCandidate!);
+					model = nextCandidate;
+					error = undefined;
+					assistantError = undefined;
+					cleanTerminalAssistantStopReceived = false;
+					agentSettledReceived = false;
+					compactionStartedReceived = false;
+					afterCompactionSettlement = false;
+					forcedTermination = false;
+					childLifecycleState.compactionRetryActive = false;
+					prompt = SAME_SESSION_ACCOUNT_FALLBACK_NOTICE;
+				}
 				promptSettled = true;
 				settle(undefined);
 			} catch (promptError) {

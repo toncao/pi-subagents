@@ -506,6 +506,25 @@ export function isSameModelAccountFallback(currentModel: string | undefined, nex
 	return currentFamily === accountProviderFamily(next.provider) && current.provider.toLowerCase() !== next.provider.toLowerCase();
 }
 
+/** Resolve configured fallback models, retaining only exact-model aliases from the
+ * same supported account family. Cross-provider/model entries never become live
+ * same-session continuation targets. Unknown candidates are skipped. */
+export function resolveSameModelAccountFallbacks(
+	currentModel: string | undefined,
+	fallbackModels: readonly string[] | undefined,
+	availableModels: AvailableModelInfo[] | undefined,
+	preferredProvider?: string,
+): string[] {
+	if (!currentModel || !fallbackModels?.length || !availableModels?.length) return [];
+	const resolved: string[] = [];
+	for (const fallback of fallbackModels) {
+		const candidate = resolveSubagentModelCandidate(fallback, availableModels, preferredProvider);
+		if (!candidate || !isSameModelAccountFallback(currentModel, candidate)) continue;
+		if (!resolved.includes(candidate)) resolved.push(candidate);
+	}
+	return resolved;
+}
+
 function completedToolHistory(messages: readonly unknown[]): { completed: number; safe: boolean } {
 	const pending = new Set<string>();
 	let completed = 0;
