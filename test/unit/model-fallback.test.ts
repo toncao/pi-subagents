@@ -150,6 +150,74 @@ describe("model fallback helpers", () => {
 		assert.equal(resolveModelCandidate("openai/gpt-5-mini", registry), "openai/gpt-5-mini");
 	});
 
+	it("resolves an exact namespaced id within its own registered provider", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" },
+			{ provider: "proxy", id: "devin/swe-2", fullId: "proxy/devin/swe-2" },
+		];
+		for (const suffix of ["", ":high", ":max"]) {
+			const query = `devin/swe-2${suffix}`;
+			const canonical = `devin/devin/swe-2${suffix}`;
+			assert.equal(resolveModelCandidate(query, registry, "proxy"), canonical);
+			assert.deepEqual(buildModelCandidates(query, [], registry, "proxy", { origin: "explicit" }), [canonical]);
+			assert.deepEqual(buildModelCandidates(canonical, [], registry), [canonical]);
+		}
+	});
+
+	it("keeps namespaced fallback models in order without unavailable warnings", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" },
+		];
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (message: unknown) => warnings.push(String(message));
+		try {
+			for (const suffix of [":high", ":max"]) {
+				assert.deepEqual(
+					buildModelCandidates("openai/gpt-5-mini", [`devin/swe-2${suffix}`, `devin/devin/swe-2${suffix}`, "anthropic/claude-sonnet-4"], registry),
+					["openai/gpt-5-mini", `devin/devin/swe-2${suffix}`, "anthropic/claude-sonnet-4"],
+				);
+			}
+		} finally {
+			console.warn = originalWarn;
+		}
+		assert.deepEqual(warnings, []);
+	});
+
+	it("prefers a fully qualified match over a same-provider namespaced id", () => {
+		const registry = [
+			{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" },
+			{ provider: "devin", id: "swe-2", fullId: "devin/swe-2" },
+		];
+		assert.equal(resolveModelCandidate("devin/swe-2:high", registry), "devin/swe-2:high");
+	});
+
+	it("never resolves a registered provider query to another provider's namespaced id", () => {
+		const registry = [
+			{ provider: "devin", id: "other-model", fullId: "devin/other-model" },
+			{ provider: "proxy", id: "devin/swe-2", fullId: "proxy/devin/swe-2" },
+		];
+		assert.throws(
+			() => buildModelCandidates("devin/swe-2:high", [], registry, "proxy", { origin: "explicit" }),
+			/Unknown subagent model/,
+		);
+	});
+
+	it("still enforces cached exclusions for resolved namespaced models", () => {
+		const registry = [
+			...availableModels,
+			{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" },
+		];
+		recordModelFailure({ provider: "devin", modelId: "devin/swe-2", reason: "runtime failure" });
+		assert.throws(
+			() => buildModelCandidates("devin/swe-2:max", [], registry, undefined, { origin: "explicit" }),
+			/excluded and cannot be replaced by a fallback/,
+		);
+		assert.deepEqual(buildModelCandidates("openai/gpt-5-mini", ["devin/swe-2:max"], registry), ["openai/gpt-5-mini"]);
+	});
+
 	it("resolves a bare id when there is exactly one registry match", () => {
 		assert.equal(resolveModelCandidate("gpt-5-mini", availableModels), "openai/gpt-5-mini");
 	});

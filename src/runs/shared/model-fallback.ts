@@ -170,10 +170,14 @@ function resolveBaseModelCandidate(
 	if (exact) return exact.fullId;
 
 	const { queryProvider } = splitQualifiedModelQuery(baseModel, availableModels);
-	if (queryProvider === undefined) {
-		const exactId = resolveExactIdMatches(baseModel, availableModels, preferredProvider);
-		if (exactId) return exactId;
-	}
+	// A provider can register ids that already contain its own namespace, e.g.
+	// provider=devin, id=devin/swe-2. Accept that exact catalog id, but keep a
+	// registered provider prefix binding: never route it to another provider.
+	const exactIdModels = queryProvider === undefined
+		? availableModels
+		: availableModels.filter((entry) => normalizeModelSegment(entry.provider) === queryProvider);
+	const exactId = resolveExactIdMatches(baseModel, exactIdModels, preferredProvider);
+	if (exactId) return exactId;
 
 	return fuzzyResolveModel(baseModel, availableModels, preferredProvider);
 }

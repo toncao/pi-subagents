@@ -252,7 +252,7 @@ You do not have to spell a model exactly. Model ids are matched fuzzily against 
 
 Exact `provider/id` matches still win, and a qualified provider query never silently switches providers — it only matches within the named provider. Ambiguous bare ids that exist under multiple providers still require a provider prefix or the current session's provider to disambiguate.
 
-Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that matches a registered provider still means `provider/id`.
+Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that matches a registered provider restricts resolution to that provider. An exact catalog id within that provider also matches: provider `devin` with id `devin/swe-2` accepts `devin/swe-2:high` and resolves to the canonical `devin/devin/swe-2:high`. The repeated namespace is intentional (`provider/id`), not a second upstream prefix. Exact fully qualified matches take precedence; this never routes a provider-qualified query to another provider.
 
 ## Model scope enforcement
 
