@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { findModelInfo, type ModelInfo } from "./model-info.ts";
+import type { ModelInfo } from "./model-info.ts";
 
 type SubagentExecutionContext = "fresh" | "fork";
 
@@ -114,20 +114,6 @@ export function canPreferForkFromSnapshot(input: PreferredForkSnapshot): boolean
 	} catch {
 		return false;
 	}
-}
-
-/** Decide whether a resolved child model uses Anthropic's provider or message API, which
- * requires the sanitized fork to disable thinking. Unknown models stay conservative. */
-export function forkedChildRequiresThinkingOff(
-	model: string | undefined,
-	availableModels?: ModelInfo[],
-	preferredProvider?: string,
-): boolean {
-	if (!model) return true;
-	const info = findModelInfo(model, availableModels, preferredProvider);
-	if (!info) return true;
-	return info.provider.toLowerCase() === "anthropic"
-		|| info.api?.toLowerCase() === "anthropic-messages";
 }
 
 function createEntryId(entries: BranchSessionEntry[]): string {

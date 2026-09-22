@@ -5,6 +5,7 @@
  * the detached runner from the step it received in its config.
  */
 import * as fs from "node:fs";
+import { sourceSlicePaths } from "./source-slice-policy.ts";
 import * as path from "node:path";
 import type { ChildWatchdogConfig, ChildWatchdogStatusEvent } from "../../watchdog/child-status.ts";
 import type { ThinkingLevel } from "../../shared/model-info.ts";
@@ -241,11 +242,13 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 	let structuredCalled = false;
 	let structuredAcceptanceProvided = false;
 
+	const slicePaths = sourceSlicePaths(input.extensionBindings);
 	const config: ChildRuntimeConfig = {
 		cwd: input.cwd,
 		...(input.runId ? { runId: input.runId } : {}),
 		agent: input.childAgentName,
 		childIndex: input.childIndex,
+		...(slicePaths ? { sourceSlicePaths: slicePaths } : {}),
 		fanoutChild: fanout,
 		...(input.sessionName?.trim() ? { sessionName: input.sessionName.trim() } : {}),
 		...(input.intercomSessionName ? { intercomSessionName: input.intercomSessionName } : {}),
@@ -266,7 +269,8 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(input.forkCacheKey?.trim() ? { forkCacheKey: input.forkCacheKey.trim() } : {}),
 		...(permissions ? { permissions } : {}),
 		...(input.toolBudget ? { toolBudget: input.toolBudget } : {}),
-		...(input.childWatchdog ? { childWatchdog: input.childWatchdog } : {}),
+		// Source-only slices must not trigger watchdog LSP/executable diagnostics.
+		...(!slicePaths && input.childWatchdog ? { childWatchdog: input.childWatchdog } : {}),
 		...(input.watchdogStatus ? { watchdogStatus: input.watchdogStatus } : {}),
 		waitTool: {
 			enabled: input.waitToolEnabled ?? true,

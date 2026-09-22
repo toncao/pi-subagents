@@ -29,7 +29,7 @@ import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { applyWatchdogLaunchRules } from "../../watchdog/rules.ts";
 import { childWatchdogProgressForModel } from "../../watchdog/child-status.ts";
-import { normalizeParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
+import { forkedChildRequiresThinkingOff, normalizeParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
 import { projectChainOutputSchemas, resolveEffectiveOutputSchema } from "../shared/child-launch-plan.ts";
 import { formatRetainedChildren, listRetainedChildren } from "../background/retained-children.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
@@ -55,7 +55,7 @@ import { encodeIndexSegment } from "../background/index-segment.ts";
 import { enqueueChainAppendRequest, readPendingChainAppendRequests, runnerStepOutputNames } from "../background/chain-append.ts";
 import { ChainOutputValidationError, validateChainOutputBindingsWithContext } from "../shared/chain-outputs.ts";
 import { acceptanceHasTypedVerify, normalizeGateAcceptance, resolveAcceptanceReportMode, TYPED_VERIFY_OUTPUT_SCHEMA_CONFLICT, validateAcceptanceInput, validateExecutionAcceptance, validateExecutionAcceptancePolicy } from "../shared/acceptance.ts";
-import { canPreferFork, createForkContextResolver, forkedChildRequiresThinkingOff, resolveSubagentLaunchContext } from "../../shared/fork-context.ts";
+import { canPreferFork, createForkContextResolver, resolveSubagentLaunchContext } from "../../shared/fork-context.ts";
 import { createPrunedForkSessionWriter } from "../../shared/pruned-fork.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
@@ -68,6 +68,7 @@ import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
+import { sliceCapabilityCeiling } from "../../workflows/implementation-slices.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { resolveRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, outputPathMappingFromTask, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -5821,6 +5822,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							...(workflowArgs ? { args: workflowArgs } : {}),
 							workflowRunId,
 							processCwd: ctx.cwd,
+							slices: { artifactsDir: workflowArtifactsDir, workflowRunId, cwd: workflowCwd },
 							globalConcurrencyLimit: requestParams.globalConcurrencyLimit ?? deps.config.globalConcurrencyLimit,
 							timeoutMs: timeout,
 							signal: controller.signal,
@@ -5887,6 +5889,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								appendWorkflowEvent({ type: "subagent.workflow.emit", value: emits.at(-1) });
 							},
 							launch: async (key, childParams, workflowSignal, admission) => {
+								if (admission.sliceRole) {
+									const agent = resolveAgentName(String(childParams.agent), discoverWorkflowAgents(workflowCwd, resolveExecutionAgentScope(workflowChildDefaults.agentScope)).agents).agent;
+									if (!agent || agent.runner) throw new Error("Persisted slices require native Pi agents; no alternate runner fallback.");
+								}
 								if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."), childParams, deps.state);
 								const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
 								if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)), childParams, deps.state, { state: "partial", reason: "budget_exhausted" });
@@ -5902,7 +5908,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								let preparedChildParams: SubagentParamsLike | undefined;
 								const result = await runMissionWorkflowChild(missionBinding, workflowRunId, key, childPhase, () => {
 									const childRequest = bindMissionWorkflowChildAsyncLaunch(
-										{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: workflowRunId, workflowKey: key, ctxCwd: parentCwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: discoverWorkflowAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), outputClaimPath: childOutputClaimPaths.get(key), options: { missionDetached: detachWorkflowChildMissions, awaitDetachedChild: true, runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: workflowCapabilityCeiling } }), runFanoutAdmitted: admission.admitted },
+										{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: workflowRunId, workflowKey: key, ctxCwd: parentCwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: discoverWorkflowAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), outputClaimPath: childOutputClaimPaths.get(key), options: { missionDetached: detachWorkflowChildMissions, awaitDetachedChild: true, runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: intersectSubagentCapabilityCeilings(workflowCapabilityCeiling, admission.sliceRole ? sliceCapabilityCeiling(admission.sliceRole) : undefined) } }), runFanoutAdmitted: admission.admitted },
 										missionBinding,
 										deps.asyncByDefault,
 										undefined,
@@ -6125,6 +6131,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					...(workflowArgs ? { args: workflowArgs } : {}),
 					workflowRunId: foregroundWorkflowRunId,
 					processCwd: ctx.cwd,
+					...(!delegatedWorkflowPermit ? { slices: { artifactsDir: workflowArtifactsDir, workflowRunId: foregroundWorkflowRunId, cwd: workflowCwd } } : {}),
 					...(delegatedWorkflowPermit ? { oneUsePermit: { claim: (key: string) => claimWorkflowChildPermit(delegatedWorkflowPermit, foregroundWorkflowRunId, key) } } : {}),
 					globalConcurrencyLimit: requestParams.globalConcurrencyLimit ?? deps.config.globalConcurrencyLimit,
 					timeoutMs: timeout,
@@ -6157,6 +6164,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						sendWorkflowProgress();
 					},
 					launch: async (key, childParams, workflowSignal, admission) => {
+						if (admission.sliceRole) {
+							const agent = resolveAgentName(String(childParams.agent), discoverWorkflowAgents(workflowCwd, resolveExecutionAgentScope(workflowChildDefaults.agentScope)).agents).agent;
+							if (!agent || agent.runner) throw new Error("Persisted slices require native Pi agents; no alternate runner fallback.");
+						}
 						if (delegatedWorkflowPermit && admission.batch) throw new Error("Workflow child permit does not support runs.all.");
 						if (delegatedWorkflowPermit && childParams.resume !== undefined) throw new Error("Workflow child permit does not support retained resume.");
 						if (delegatedWorkflowPermit && childParams.async === true) throw new Error("Workflow child permit supports one foreground child only.");
@@ -6175,7 +6186,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						let preparedChildParams: SubagentParamsLike | undefined;
 						const result = await runMissionWorkflowChild(missionBinding, foregroundWorkflowRunId, key, childPhase, () => {
 							const childRequest = bindMissionWorkflowChildAsyncLaunch(
-								{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams: delegatedWorkflowPermit ? { ...childParams, async: false } : childParams, parentWorkflowRunId: foregroundWorkflowRunId, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: discoverWorkflowAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), outputClaimPath: childOutputClaimPaths.get(key), options: { missionDetached: detachWorkflowChildMissions, suppressRoutineResultIntercom: chatProgress.mode === "live-card", runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: workflowCapabilityCeiling } }), runFanoutAdmitted: admission.admitted },
+								{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams: delegatedWorkflowPermit ? { ...childParams, async: false } : childParams, parentWorkflowRunId: foregroundWorkflowRunId, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: discoverWorkflowAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), outputClaimPath: childOutputClaimPaths.get(key), options: { missionDetached: detachWorkflowChildMissions, suppressRoutineResultIntercom: chatProgress.mode === "live-card", runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: intersectSubagentCapabilityCeilings(workflowCapabilityCeiling, admission.sliceRole ? sliceCapabilityCeiling(admission.sliceRole) : undefined) } }), runFanoutAdmitted: admission.admitted },
 								missionBinding,
 								deps.asyncByDefault,
 								undefined,

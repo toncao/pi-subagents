@@ -1,7 +1,5 @@
-import { forkedChildRequiresThinkingOff } from "../../shared/fork-context.ts";
-import { splitKnownThinkingSuffix as splitThinkingSuffix, splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { splitKnownThinkingSuffix as splitThinkingSuffix, splitKnownThinkingSuffix, findModelInfo, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
-import { getProviderLiveness } from "./provider-liveness.ts";
 
 export type { AvailableModelInfo };
 
@@ -11,6 +9,20 @@ export interface ModelSelectionEvidence {
 }
 
 export { splitThinkingSuffix };
+
+/** Decide whether a resolved child model uses Anthropic's provider or message API, which
+ * requires the sanitized fork to disable thinking. Unknown models stay conservative. */
+export function forkedChildRequiresThinkingOff(
+	model: string | undefined,
+	availableModels?: AvailableModelInfo[],
+	preferredProvider?: string,
+): boolean {
+	if (!model) return true;
+	const info = findModelInfo(model, availableModels, preferredProvider);
+	if (!info) return true;
+	return info.provider.toLowerCase() === "anthropic"
+		|| info.api?.toLowerCase() === "anthropic-messages";
+}
 
 /** Pin `:off` onto only the candidates that cannot resume a sanitized fork with thinking.
  *
