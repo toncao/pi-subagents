@@ -81,6 +81,8 @@ export interface ChildRuntimeConfig {
 	inheritSkills?: boolean;
 	forkCacheKey?: string;
 	permissions?: ChildPermissions;
+	/** Exact mutation inventory for an opted-in source-only slice; [] is review-only. */
+	sourceSlicePaths?: string[];
 	toolBudget?: ResolvedToolBudget;
 	childWatchdog?: ChildWatchdogConfig;
 	/** Receives child watchdog status events. */

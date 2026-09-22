@@ -33,6 +33,7 @@ export const DEFAULT_SUBAGENT_TOOL_DESCRIPTION = `${EXECUTION_GUIDANCE}\n\n${SUB
 export const SUBAGENT_TOOL_PROMPT_SNIPPET = "Delegate to subagents; orchestrate in one workflow call.";
 export const SUBAGENT_TOOL_PROMPT_GUIDELINES = [
 	"Use subagent only when delegation is needed.",
+	"Write self-contained subagent task assignments: the child cannot see this conversation.",
 ];
 
 export const COMPACT_SUBAGENT_TOOL_DESCRIPTION = DEFAULT_SUBAGENT_TOOL_DESCRIPTION;

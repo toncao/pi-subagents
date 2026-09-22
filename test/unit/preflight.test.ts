@@ -364,6 +364,35 @@ Project prompt.
 		assert.deepEqual(result.contract.modelCandidates, ["test/fallback"]);
 	});
 
+	it("keeps a provider-prefixed catalog id as the first usable configured fallback", async () => {
+		const cwd = path.join(tempDir, "repo-namespaced-fallback");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "scout.md"), `---
+name: scout
+description: Project scout
+model: openai/placeholder
+fallbackModels:
+  - devin/swe-2:high
+  - test/fallback
+thinking: medium
+---
+Project prompt.
+`);
+		const availableModels = [
+			{ provider: "devin", id: "devin/swe-2", reasoning: true, thinkingLevelMap: { high: "high", max: "max" } },
+			{ provider: "test", id: "fallback" },
+		];
+		const configured = await resolveSubagentLaunchContract({ agent: "scout", cwd, availableModels });
+		assert.equal(configured.ok, true);
+		assert.deepEqual(configured.contract.modelCandidates, ["devin/devin/swe-2:high", "test/fallback:medium"]);
+
+		const explicit = await resolveSubagentLaunchContract({ agent: "scout", cwd, availableModels, model: "devin/swe-2:max" });
+		assert.equal(explicit.ok, true);
+		assert.equal(explicit.contract.model, "devin/devin/swe-2:max");
+		assert.equal(explicit.contract.modelCandidates[0], "devin/devin/swe-2:max");
+		assert.equal(explicit.contract.thinking, "max");
+	});
+
 	it("rejects an explicit unknown per-call model even when a fallback is configured", async () => {
 		const cwd = path.join(tempDir, "repo-explicit-unknown-model");
 		fs.mkdirSync(cwd, { recursive: true });

@@ -10,6 +10,7 @@ import type { ChildSessionLaunch } from "./child-session.ts";
 import type { ArbiterModelContext } from "./llm-intent-arbiter.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { projectRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
+import { registerSourceSlicePolicy } from "./source-slice-policy.ts";
 
 /** Inline extension shape accepted by pi's resource loader (`extensionFactories`). */
 export interface ChildHookExtension {
@@ -183,6 +184,7 @@ function childHooks(config: ChildRuntimeConfig, capture?: OwnedCapture, holdFina
 		proof.factories = hooks.map((hook) => hook.factory);
 		promptProofs.set(hooks[0]!.factory, proof);
 	}
+	if (config.sourceSlicePaths) hooks.push({ name: "pi-subagents:source-slice", factory: (pi) => registerSourceSlicePolicy(pi, config.sourceSlicePaths!) });
 	if (config.fast) hooks.push({ name: "pi-subagents:fast-mode", factory: (pi) => registerSubagentFastModeExtension(pi) });
 	if (config.fanoutChild) hooks.push({ name: "pi-subagents:fanout-child", factory: (pi) => registerFanoutChildSubagentExtension(pi, runtime) });
 	return hooks;

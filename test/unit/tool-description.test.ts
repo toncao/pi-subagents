@@ -33,11 +33,13 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 describe("registered subagent tool description", () => {
 	it("uses concise split metadata only by default", () => {
 		assert.equal(buildSubagentToolDescription(), DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.match(DEFAULT_SUBAGENT_TOOL_DESCRIPTION, /self-contained child task assignments/i);
 		const metadata = buildSubagentToolPromptMetadata();
 		assert.equal(metadata.promptSnippet, SUBAGENT_TOOL_PROMPT_SNIPPET);
 		assert.deepEqual(metadata.promptGuidelines, SUBAGENT_TOOL_PROMPT_GUIDELINES);
 		assert.ok(Buffer.byteLength(metadata.promptGuidelines!.join("\n")) < 400);
 		for (const guideline of metadata.promptGuidelines!) assert.match(guideline, /subagent/);
+		assert.match(SUBAGENT_TOOL_PROMPT_GUIDELINES.join("\n"), /self-contained subagent task assignments/i);
 		for (const toolDescriptionMode of ["full", "compact", "custom"] as const) {
 			assert.deepEqual(buildSubagentToolPromptMetadata({ toolDescriptionMode }), {});
 		}

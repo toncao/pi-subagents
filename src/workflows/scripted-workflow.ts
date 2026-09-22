@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { ImplementationSlices, sliceWriterSchema, sliceReviewSchema } from "./implementation-slices.ts";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -770,7 +771,30 @@ function launchRunsAllPermissive(items) {
   return { calls, launched: launched.map((entry, index) => entry ?? runHostCall(calls[index].key, calls[index].params, false, undefined)) };
 }
 
+function runSlice(spec) {
+  assertJsonValue(spec, "runs.slice contract");
+  let tracked;
+  const observe = (items) => trackRunObservation(items, tracked);
+  const started = hostCall("slice.begin", { spec }, { key: spec.key, operation: "slice" });
+  const chain = started.then((receipt) => {
+    const writer = receipt.spec.writer;
+    const params = writer ? { ...writer, context: "fresh", worktree: false, task: receipt.writerTask, outputSchema: receipt.writerSchema, acceptance: { level: "none", reason: "Persisted slice uses its own exact-revision review; no executable verification." }, extensionBindings: { "pi-subagents.source-slice/1": { paths: receipt.spec.paths } }, output: "slices/" + receipt.attempt + "/writer.json" } : undefined;
+    const result = params ? runCollected(spec.key + ".writer", params, observe) : Promise.resolve();
+    return result.then(() => hostCall("slice.seal", { attempt: receipt.attempt }));
+  }).then((receipt) => {
+    if (receipt.state !== "review-required") return receipt;
+    const params = { ...receipt.spec.reviewer, context: "fresh", worktree: false, task: receipt.reviewTask, outputSchema: receipt.reviewSchema, acceptance: { level: "none", reason: "Read-only exact-revision slice review." }, extensionBindings: { "pi-subagents.source-slice/1": { paths: [] } }, output: "slices/" + receipt.attempt + "/review.json" };
+    return runCollected(spec.key + ".review", params, observe).then(() => hostCall("slice.reviewed", { attempt: receipt.attempt }));
+  });
+  tracked = trackObservationTracker({ observations: [], consumed: false, dependencies: [promiseObservationTracker(started)] }, chain, true);
+  return tracked;
+}
+
 const runs = Object.freeze({
+  slice(spec) { return runSlice(spec); },
+  acceptSlice(attempt, revision, reason) {
+    return hostCall("slice.accept", { attempt, revision, reason }, { key: attempt, operation: "slice" });
+  },
   run(key, params) {
     validateRunCall(key, params, "runs.run", runFingerprints);
     const launched = runHostCall(key, params, false);
@@ -1171,6 +1195,8 @@ export interface RunWorkflowScriptOptions {
 	script: string;
 	/** Workflow run ID for notifications. Required when onChildSettled is provided. */
 	workflowRunId?: string;
+	/** Host-owned artifact routing. Omitted by restricted delegation hosts. */
+	slices?: { artifactsDir: string; workflowRunId: string; cwd: string };
 	/** Host-only first-slice admission context. It is never sent to the workflow worker. */
 	oneUsePermit?: { claim: (key: string) => string | undefined };
 	timeoutMs?: number;
@@ -1180,7 +1206,7 @@ export interface RunWorkflowScriptOptions {
 	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>, signal: AbortSignal) => void | Promise<void>;
-	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
+	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean; sliceRole?: "writer" | "reviewer" }) => Promise<WorkflowScriptChildResult>;
 	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
@@ -1937,6 +1963,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const launches = new Map<string, { fingerprint: string; promise: Promise<WorkflowScriptChildResult>; observed: boolean; generatedLaneKey?: string }>();
 	const steers = new Map<number, { key: string; promise: Promise<WorkflowSteerResult>; observed: boolean }>();
 	const hostCalls = new Map<number, { key: string; promise: Promise<WorkflowHostCommandResult>; observed: boolean }>();
+	const sliceStore = options.slices ? new ImplementationSlices(options.slices) : undefined;
+	const sliceCalls = new Map<number, boolean>();
 	const stoppedLaunches = new Set<string>();
 	const childStopControllers = new Map<string, AbortController>();
 	const batchAdmissions = new Map<string, Promise<void>>();
@@ -2042,6 +2070,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
 			if (settled || finishing) return;
 			finishing = true;
+			const slicePersistenceErrors = sliceStore?.abandon("Workflow ended before slice handoff/review settled; reconcile native task and process evidence before a successor.") ?? [];
+			if (slicePersistenceErrors.length) {
+				const message = [...("error" in outcome ? [outcome.error.message] : []), ...slicePersistenceErrors].join("\n");
+				outcome = { error: new Error(message) };
+			}
 			if (assemblyFlushTimer !== undefined) {
 				clearTimeout(assemblyFlushTimer);
 				assemblyFlushTimer = undefined;
@@ -2055,7 +2088,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				options.signal?.removeEventListener("abort", onAbort);
 				void worker.terminate();
 				const unobservedKeys = "value" in outcome ? [...launches].filter(([, launch]) => !launch.observed).map(([key]) => key) : [];
-				const completionError = unobservedKeys.length > 0
+				const completionError = "value" in outcome && [...sliceCalls.values()].some((observed) => !observed)
+					? new Error("workflowScript completed with unawaited slice operation; await or return it.")
+					: unobservedKeys.length > 0
 					? new Error(`workflowScript completed with unawaited runs.run launch(es): ${unobservedKeys.map((key) => `'${key}'`).join(", ")}. For ordinary parallel fanout use await runs.all([{key, agent, task}, ...]); do not read .output from unawaited launches.`)
 					: "value" in outcome
 						? (() => {
@@ -2181,6 +2216,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					const steer = steers.get(message.callId);
 					if (steer) steer.observed = true;
 					else observedSteerCalls.add(message.callId);
+				} else if (message.operation === "slice") {
+					sliceCalls.set(message.callId, true);
 				} else if (message.operation === "host") {
 					const host = hostCalls.get(message.callId);
 					if (host) host.observed = true;
@@ -2213,6 +2250,31 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					},
 				);
 			};
+			if (message.method.startsWith("slice.")) {
+				try {
+					if (!sliceStore || options.oneUsePermit) throw new Error("Persisted slices are unavailable in this host context.");
+					if (acceptanceRecoveryBarrier) throw new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, message.method));
+					if (message.method === "slice.begin" || message.method === "slice.accept") sliceCalls.set(message.callId, sliceCalls.get(message.callId) === true);
+					const args = message.args;
+					let value: unknown;
+					if (message.method === "slice.begin") {
+						if ([...launches.keys()].some((key) => !children.has(key))) throw new Error("Cannot begin a slice while another workflow child is active.");
+						if (isRecord(args.spec) && (launches.has(`${args.spec.key}.writer`) || launches.has(`${args.spec.key}.review`))) throw new Error("Slice child key was already used.");
+						const receipt = sliceStore.begin(args.spec);
+						value = { ...receipt, writerSchema: sliceWriterSchema, writerTask: receipt.spec.writer ? sliceStore.writerTask(receipt.attempt) : undefined };
+					} else if (message.method === "slice.accept") {
+						if (typeof args.attempt !== "string" || typeof args.revision !== "string" || typeof args.reason !== "string") throw new Error("Invalid parent acceptance.");
+						value = sliceStore.accept(args.attempt, args.revision, args.reason);
+					} else {
+						if (typeof args.attempt !== "string") throw new Error("Invalid slice attempt.");
+						const key = sliceStore.key(args.attempt);
+						if (message.method === "slice.seal") value = { ...sliceStore.seal(args.attempt, children.get(`${key}.writer`)), reviewSchema: sliceReviewSchema };
+						else if (message.method === "slice.reviewed") value = sliceStore.reviewed(args.attempt, children.get(`${key}.review`));
+						else throw new Error("Unknown slice operation.");
+					}
+					return respond(Promise.resolve(value), "slice result");
+				} catch (error) { return respond(Promise.reject(error)); }
+			}
 			if (message.method === "state.get" || message.method === "state.set") {
 				if (!options.state) return respond(Promise.reject(new Error("Workflow state is unavailable without a mission.")));
 				let key: string;
@@ -2415,7 +2477,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				});
 				admission = Promise.resolve().then(() => {
 					if (settled || finishing) return;
-					for (const call of calls) assertRecoveryBarrierAllowsRun(call.key, call.params);
+					for (const call of calls) {
+						assertRecoveryBarrierAllowsRun(call.key, call.params);
+						sliceStore?.assertLaunch(call.key);
+					}
 					return options.admit?.(calls, childController.signal);
 				});
 				if (batch) batchAdmissions.set(batch.id, admission);
@@ -2463,8 +2528,21 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 						return stoppedChildResult(key, text);
 					}
-					const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
-					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
+					const sliceRole = sliceStore?.policy(key);
+					const attempt = sliceStore?.attemptForWriter(key);
+					const progressTimer = attempt ? setInterval(() => {
+						try {
+							const error = sliceStore!.tick(attempt);
+							if (error) childStopController.abort(new Error(error));
+						} catch (error) { childStopController.abort(error); }
+					}, 1000) : undefined;
+					const stopProgress = () => { if (progressTimer) clearInterval(progressTimer); };
+					childSignal.addEventListener("abort", stopProgress, { once: true });
+					let result: WorkflowScriptChildResult;
+					try {
+						result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined, ...(sliceRole ? { sliceRole } : {}) });
+					} finally { stopProgress(); childSignal.removeEventListener("abort", stopProgress); }
+					const autoResumeParams = sliceRole ? undefined : setupAbortResumeParams(params, result, childSignal);
 					if (!autoResumeParams) return result;
 					resolvedResumeLineage = [...new Set([...(resolvedResumeLineage ?? []), result.runId!])];
 					trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), ...(generatedLaneKey ? { generatedLaneKey } : {}), phase: "auto-resume", runId: result.runId });

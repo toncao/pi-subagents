@@ -77,6 +77,22 @@ describe("in-process foreground child", () => {
 		}
 	});
 
+	it("propagates source-slice bindings to native hooks and suppresses executable watchdog diagnostics", () => {
+		for (const host of ["parent", "runner"] as const) {
+			const launch = buildInProcessChildLaunch({
+				host, cwd: tempDir, sessionEnabled: false, childAgentName: "slice-reviewer", childIndex: 0,
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+				tools: ["read"], extensionBindings: { "pi-subagents.source-slice/1": { paths: [] } },
+				capabilityCeiling: { version: 1, allowedTools: ["read"], denyExtensions: true, sources: ["test-slice"] },
+				childWatchdog: { enabled: true } as never,
+			});
+			assert.deepEqual(launch.config.sourceSlicePaths, []);
+			assert.equal(launch.config.childWatchdog, undefined);
+			assert.equal(launch.session.ambientExtensions, false);
+			assert.ok(launch.session.hooks.some((hook) => hook.name === "pi-subagents:source-slice"));
+		}
+	});
+
 	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {
 		const route = createNestedRoute("hooks-fanout");
 		try {

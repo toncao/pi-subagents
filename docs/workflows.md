@@ -139,6 +139,16 @@ subagent({ workflowScript: `
 ` });
 ```
 
+### Persisted source implementation slices
+
+For a long writer assignment that needs early durable source, exact-revision
+independent review, and an explicit parent decision between changes, use the
+opt-in [`runs.slice` / `runs.acceptSlice` protocol](implementation-slices.md).
+It composes ordinary native launches and managed artifacts; it never silently
+retries a failed writer or substitutes parent/CLI execution. The initial version
+is source-only and bounded to one coherent slice per workflow. Ordinary tasks
+can keep using `runs.run` without this protocol.
+
 ### Parallel sequential lanes
 
 For a bounded set of independent chains, `runs.lanes(...)` removes the mechanical loop that would otherwise connect each lane's stages. It is a helper inside `workflowScript`, not a new top-level `subagent` execution mode:
