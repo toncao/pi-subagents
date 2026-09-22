@@ -495,6 +495,51 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(status.steps?.[0]?.thinking, "high");
 	});
 
+	it("retries an async child on a different model after a zero-progress HTTP 401", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const primary = "openai/placeholder";
+		const fallback = "devin/swe-2";
+		const error = "OpenAI API error (401): invalid_api_key";
+		mockPi.onCall({ jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				model: "placeholder",
+				stopReason: "error",
+				errorMessage: error,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		}] });
+		mockPi.onCall({ output: "async fallback completed" });
+		const id = `async-zero-progress-fallback-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Perform once",
+			agentConfig: makeAgent("worker", { model: primary, fallbackModels: [fallback] }),
+			availableModels: [
+				{ provider: "openai", id: "placeholder", fullId: primary },
+				{ provider: "devin", id: "swe-2", fullId: fallback },
+			],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-zero-progress-fallback" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.output, "async fallback completed");
+		assert.deepEqual(payload.results[0]?.attemptedModels, [primary, fallback]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map(({ model, success, error: attemptError }) => ({ model, success, error: attemptError })), [
+			{ model: primary, success: false, error },
+			{ model: fallback, success: true, error: undefined },
+		]);
+		const calls = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { sessionId?: string; args?: string[] });
+		assert.equal(new Set(calls.map((call) => call.sessionId)).size, 2);
+		assert.deepEqual(calls.map((call) => call.args?.find((arg) => arg === primary || arg === fallback)), [primary, fallback]);
+	});
+
 	it("continues an inherited-model async session on an exact account alias without replay", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const target = path.join(tempDir, `async-same-session-${Date.now().toString(36)}.txt`);
 		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };

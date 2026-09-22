@@ -37,6 +37,8 @@ export interface RunnerSubagentStep {
 	/** Original cwd input retained for launch diagnostics. */
 	requestedCwd?: string;
 	model?: string;
+	/** Ordered different-model/provider candidates eligible only after a verified zero-progress failure. */
+	zeroProgressFallbackModels?: string[];
 	/** Resolved exact-model aliases eligible for native same-session continuation. */
 	accountFallbackModels?: string[];
 	contextLimit?: number;

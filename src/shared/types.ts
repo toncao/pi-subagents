@@ -1283,7 +1283,7 @@ export interface SingleResult {
 	messages?: Message[];
 	usage: Usage;
 	model?: string;
-	/** Ordered live-session account candidates attempted without replaying prior tools. */
+	/** Ordered model candidates attempted, including zero-progress fresh attempts and same-session account continuation. */
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	/** Authoritative before/after Git evidence captured by a pane-native remote machine. */

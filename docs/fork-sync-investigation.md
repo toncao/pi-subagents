@@ -54,14 +54,21 @@ belong to the companion multi-account extension. This package consumes only its
 registered provider/model catalog. This change does not edit credentials, account
 order, or user settings and does not make live-auth claims.
 
-## 4. Continue post-tool work without replay
+## 4. Fail over before progress; continue post-tool work without replay
 
 **Status: implemented in this fork.**
 
 - `fallbackModels` remains accepted in agent frontmatter, runtime definitions,
-  profiles, and `subagents.agentOverrides` for compatibility with existing fork
-  configuration.
-- `src/runs/shared/model-resolution.ts` admits continuation only after a trusted
+  profiles, and `subagents.agentOverrides` as an ordered recovery policy.
+- Before useful assistant output, tool history, accepted follow-up input, mutation
+  evidence, cancellation, deadline, or budget exhaustion, terminal provider/model failures (including HTTP
+  401) may start the original task in a new child attempt on the next configured
+  candidate. All candidates share the original deadline and persist per-attempt
+  model, error, exit, and usage evidence.
+- Provider error envelopes retain their underlying error instead of being replaced
+  by model-response verification, so authentication and transport failures remain
+  classifiable.
+- `src/runs/shared/model-resolution.ts` admits post-tool continuation only after a trusted
   terminal rate/quota error and a fully paired, successful tool-call history.
   Pending or failed tools, active tools, cancellation, exhausted budgets, structured
   output, different models, and different provider families veto it.
@@ -71,14 +78,15 @@ order, or user settings and does not make live-auth claims.
 - `src/runs/foreground/execution.ts` and
   `src/runs/background/run-child-session.ts` send only the bounded continuation
   notice; they never replay the original `Task:`.
-- Results persist `attemptedModels` and `modelAttempts` so failed account attempts
-  remain distinct from terminal success.
-- `test/integration/in-process-child.test.ts` proves a mutating tool executes once
-  across foreground continuation and proves the detached driver retains the tool
-  result in one session.
-- `test/integration/async-execution.part-1.test.ts` proves detached end-to-end
-  propagation, effective thinking replacement, one native session identity, and
-  durable attempt evidence.
+- Results persist `attemptedModels` and `modelAttempts` so zero-progress and failed
+  account attempts remain distinct from terminal success.
+- `test/integration/in-process-child.test.ts` proves ordered zero-progress HTTP 401/503
+  fallback, usage-budget and mutation vetoes, no different-model replay after useful
+  output or a completed tool, one-time mutation across foreground continuation, and
+  retained tool results in the detached driver.
+- `test/integration/async-execution.part-1.test.ts` proves detached zero-progress
+  fallback and post-tool continuation propagation, effective thinking replacement,
+  correct session identity boundaries, and durable attempt evidence.
 
 ## 5. Preserve the real child failure cause
 

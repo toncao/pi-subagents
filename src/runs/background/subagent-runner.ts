@@ -98,7 +98,7 @@ import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTr
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
 import { claimRunFanoutBatch, getRunFanoutBudgetSnapshot } from "../shared/run-fanout-budget.ts";
 import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent } from "../shared/nested-events.ts";
-import { formatSubagentModelVerificationError, isContextOverflow } from "../shared/model-resolution.ts";
+import { formatSubagentModelVerificationError, formatZeroProgressFallbackNote, isContextOverflow, isSameModelAccountFallback, isZeroProgressModelFailureAttempt } from "../shared/model-resolution.ts";
 import { markProcessTerminalCandidateLeaseRelease, processTerminalPath, writeProcessTerminalCandidate, type ProcessTerminalCandidate } from "./process-terminal.ts";
 import { createSteeringStatus, recordSteeringRequest, steeringStatus, terminalSteeringNoticeState, unconsumedSteerReason, updateSteeringTarget } from "./steering.ts";
 import { PROMPT_REDACTED, detectSubagentError, extractTextFromContent, extractToolArgsPreview, formatEmptyTerminalAssistantResponseError, getAgentDir, getFinalOutput, hasEmptyTerminalAssistantResponse, readStatus } from "../../shared/utils.ts";
@@ -1090,7 +1090,7 @@ export async function runSingleStepInner(
 		alignForkedSessionCwd(step.sessionFile, effectiveCwd);
 	}
 
-	const candidate = step.model;
+	const modelCandidates = [step.model, ...(step.zeroProgressFallbackModels ?? [])];
 	let capabilityAudit: import("../shared/capability-ceiling.ts").SubagentCapabilityAudit | undefined;
 	let launchResolvedExtensions = step.launchResolvedExtensions;
 	let finalRequiredOutputMissing: boolean | undefined;
@@ -1108,12 +1108,19 @@ export async function runSingleStepInner(
 	let contextOverflow = false;
 	let launchWarningsEmitted = false;
 	const aggregateUsage = emptyUsage();
+	const attemptedModels: string[] = [];
+	const modelAttempts: ModelAttempt[] = [];
 	let launched = false;
-	let recoveryTask = task;
 	let stagedIndexBaseline: string | undefined;
-	singleLaunch: for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
-		if (ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break singleLaunch;
-		const expectedModelForVerification = candidate && !step.skipPrimaryModelVerification ? candidate : undefined;
+	modelLaunch: for (let modelIndex = 0; modelIndex < modelCandidates.length; modelIndex++) {
+		const candidate = modelCandidates[modelIndex];
+		const accountFallbackCandidates = (step.zeroProgressFallbackModels
+			? modelCandidates.slice(modelIndex + 1).filter((next): next is string => Boolean(next) && isSameModelAccountFallback(candidate, next))
+			: modelIndex === 0 ? step.accountFallbackModels ?? [] : []);
+		let recoveryTask = task;
+		for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+		if (ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break modelLaunch;
+		const expectedModelForVerification = candidate && !(step.skipPrimaryModelVerification && modelIndex === 0) ? candidate : undefined;
 		try {
 			assertThinkingWithinCeiling({ model: candidate, configThinking: step.thinking, ceiling: step.thinkingCeiling, agent: step.agent, runId: ctx.id });
 		} catch (error) {
@@ -1172,7 +1179,7 @@ export async function runSingleStepInner(
 				extensions: step.extensions,
 				subagentOnlyExtensions: step.subagentOnlyExtensions,
 				fast: step.fast,
-				model: step.model,
+				model: candidate,
 				mcpDirectTools: step.mcpDirectTools,
 				cwd: step.cwd ?? ctx.cwd,
 				requireReadTool: Boolean(step.skills?.length),
@@ -1242,7 +1249,7 @@ export async function runSingleStepInner(
 			toolTimeoutMs: ctx.toolTimeoutMs,
 			runDeadlineAt: ctx.deadlineAt,
 			expectedModelForVerification,
-			accountFallbackCandidates: step.accountFallbackModels,
+			accountFallbackCandidates,
 			modelVerificationRegistry: step.modelVerificationRegistry,
 			modelResponseAliases: step.modelResponseAliases,
 			mutationTools: step.mutationTools,
@@ -1373,36 +1380,83 @@ export async function runSingleStepInner(
 		} : undefined;
 		const fileMutationEffect = missingRequiredOutputAfterMutation ? { status: "observed" as const, attempted: true as const, evidence: mutationEvidence } : undefined;
 		finalResult = { ...run, exitCode: effectiveExitCode, model: selectedCandidate, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
-		if (run.stopped || run.timedOut || ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break singleLaunch;
-		if (effectiveExitCode === 0 && !error) break singleLaunch;
-		const recovery = planAbortRecovery({
-			messages: run.messages,
-			error,
-			sessionAvailable: Boolean(step.sessionFile && fs.existsSync(step.sessionFile)),
-			alreadyResumed: attemptIndex > 0,
-			stopped: run.stopped || ctx.stopSignal?.aborted || ctx.skipAcceptance?.(),
-			interrupted: run.interrupted,
-			timedOut: run.timedOut || ctx.timeoutSignal?.aborted,
-			toolBudgetExhausted: run.toolBudgetBlocked || toolBudgetBlocked,
-			usageBudgetExhausted: ctx.usageBudgetExhausted?.(),
-			structuredOutputFailed: Boolean(structuredError),
-			acceptanceFailed: false,
-			currentTool: run.currentTool,
-			afterCompactionSettlement: run.afterCompactionSettlement,
+		let recoveryDiagnostic: string | undefined;
+		if (effectiveExitCode !== 0 || error) {
+			const recovery = planAbortRecovery({
+				messages: run.messages,
+				error,
+				sessionAvailable: Boolean(step.sessionFile && fs.existsSync(step.sessionFile)),
+				alreadyResumed: attemptIndex > 0,
+				stopped: run.stopped || ctx.stopSignal?.aborted || ctx.skipAcceptance?.(),
+				interrupted: run.interrupted,
+				timedOut: run.timedOut || ctx.timeoutSignal?.aborted,
+				toolBudgetExhausted: run.toolBudgetBlocked || toolBudgetBlocked,
+				usageBudgetExhausted: ctx.usageBudgetExhausted?.(),
+				structuredOutputFailed: Boolean(structuredError),
+				acceptanceFailed: false,
+				currentTool: run.currentTool,
+				afterCompactionSettlement: run.afterCompactionSettlement,
+			});
+			if (recovery.action === "resume") {
+				recoveryTask = recovery.prompt;
+				continue;
+			}
+			recoveryDiagnostic = recovery.diagnostic;
+		}
+		if (accountFallback) {
+			attemptedModels.push(...accountFallback.attemptedCandidates);
+			modelAttempts.push(...accountFallback.failedAttempts);
+		} else {
+			attemptedModels.push(candidate ?? selectedCandidate ?? "default");
+		}
+		modelAttempts.push({
+			model: accountFallback?.attemptedCandidates.at(-1) ?? candidate ?? selectedCandidate ?? "default",
+			success: effectiveExitCode === 0 && !error,
+			exitCode: effectiveExitCode,
+			...(error ? { error } : {}),
+			usage: accountFallback ? usageAfterAttempts(run.usage, accountFallback.failedAttempts) : { ...run.usage },
 		});
-		if (recovery.action === "resume") {
-			recoveryTask = recovery.prompt;
-			continue singleLaunch;
-		}
-		if (recovery.diagnostic) {
-			finalResult.abortRecoveryDiagnostic = recovery.diagnostic;
-		}
-
+		if (run.stopped || run.timedOut || ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break modelLaunch;
+		if (effectiveExitCode === 0 && !error) break modelLaunch;
 		if (isContextOverflow(error)) {
 			contextOverflow = true;
-			break singleLaunch;
+			break modelLaunch;
 		}
-		break singleLaunch;
+		const nextModel = modelCandidates[modelIndex + 1];
+		const zeroProgressFallback = Boolean(nextModel)
+			&& !run.interrupted
+			&& !run.stopped
+			&& !run.timedOut
+			&& !run.currentTool
+			&& !run.toolBudgetBlocked
+			&& !toolBudgetBlocked
+			&& !structuredError
+			&& !run.structuredOutputToolInvoked
+			&& !mutationAttemptObserved
+			&& ctx.usageBudgetExhausted?.() !== true
+			&& isZeroProgressModelFailureAttempt({ error, messages: run.messages, toolCount: run.toolCount });
+		if (!zeroProgressFallback || !nextModel) {
+			if (recoveryDiagnostic && finalResult) {
+				finalResult.abortRecoveryDiagnostic = recoveryDiagnostic;
+				modelAttempts[modelAttempts.length - 1]!.error = error ? `${error}\n${recoveryDiagnostic}` : recoveryDiagnostic;
+			}
+			break modelLaunch;
+		}
+		const note = formatZeroProgressFallbackNote(candidate ?? selectedCandidate ?? "default", error, nextModel);
+		ctx.orcaProgressTab?.append(`${note}\n`);
+		try { fs.appendFileSync(ctx.outputFile, `${note}\n`, "utf-8"); } catch { /* Observability output is best-effort. */ }
+		continue modelLaunch;
+		}
+	}
+	if (finalResult) {
+		const exposeModelAttempts = modelCandidates.length > 1 || modelAttempts.length > 1;
+		if (exposeModelAttempts) {
+			finalResult.attemptedModels = attemptedModels;
+			finalResult.modelAttempts = modelAttempts;
+		} else {
+			delete finalResult.attemptedModels;
+			delete finalResult.modelAttempts;
+		}
 	}
 
 	const rawOutput = finalResult?.finalOutput ?? "";

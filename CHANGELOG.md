@@ -15,7 +15,8 @@
 
 ### Fixed
 
-- Preserve configured `fallbackModels` as a narrow no-replay recovery path: after completed tools, rate/quota failures may switch the same live child session only to an exact-model account alias, while cancellation, budgets, structured output, incomplete/failed tool history, and cross-provider routes fail closed. Foreground and detached results retain per-account attempt evidence.
+- Honor ordered `fallbackModels` for broader provider/model failures, including HTTP 401, only while the child has zero useful output, tool history, or mutation evidence. Each zero-progress candidate starts a new child attempt under the original deadline and records attempt evidence; after progress, the existing no-replay contract still permits only same-session exact-model account continuation for rate/quota failures.
+- Preserve configured `fallbackModels` as a narrow no-replay recovery path after completed tools: rate/quota failures may switch the same live child session only to an exact-model account alias, while cancellation, budgets, structured output, incomplete/failed tool history, and cross-provider routes fail closed. Foreground and detached results retain per-account attempt evidence.
 - Prevent duplicate completion notifications when multiple extension registrations for the same session coexist in one process. Thanks to [@hongchu098](https://github.com/hongchu098) for [#2389](https://github.com/nicobailon/pi-subagents/issues/2389).
 - Make running and failed external CLI logs inspectable in Fleet, tool status, and TUI surfaces with bounded, contained reads ([#2375](https://github.com/nicobailon/pi-subagents/issues/2375), thanks [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo)).
 - Preserve and safely prune Pi 0.87 context edits when forking sessions, including replacement content and signed Anthropic thinking blocks.

@@ -74,9 +74,12 @@ import {
 	applyForkThinkingToCandidates,
 	canContinueSameSessionAfterRateLimit,
 	formatSubagentModelVerificationError,
+	formatZeroProgressFallbackNote,
 	isContextOverflow,
+	isSameModelAccountFallback,
+	isZeroProgressModelFailureAttempt,
 	resolveModelSelection,
-	resolveSameModelAccountFallbacks,
+	resolveZeroProgressFallbackModels,
 	SAME_SESSION_ACCOUNT_FALLBACK_NOTICE,
 } from "../shared/model-resolution.ts";
 import {
@@ -110,6 +113,7 @@ import {
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
 import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
+import { usageBudgetState } from "../shared/usage-budget.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
@@ -353,7 +357,9 @@ function isCompleteUsageCounter(value: unknown): value is number {
 
 const STOPPED_BEFORE_COMPLETION_ERROR = "Subagent stopped before completion.";
 const AFTER_COMPACTION_SETTLEMENT = Symbol("afterCompactionSettlement");
+const ZERO_PROGRESS_MUTATION_OBSERVED = Symbol("zeroProgressMutationObserved");
 type AbortRecoverySingleResult = SingleResult & { [AFTER_COMPACTION_SETTLEMENT]?: true };
+type ZeroProgressSingleResult = SingleResult & { [ZERO_PROGRESS_MUTATION_OBSERVED]?: true };
 interface SameSessionAccountFallback {
 	attemptedCandidates: string[];
 	failedAttempts: Array<ModelAttempt & { success: false; exitCode: 1; error: string; usage: Usage }>;
@@ -1127,7 +1133,10 @@ async function runSingleAttempt(
 					if (evt.message.model) {
 						progress.model = evt.message.model;
 						if (!result.model) result.model = evt.message.model;
-						if (expectedModelForVerification && !hasToolCall) {
+						// Preserve a provider's terminal error as the primary failure. Response
+						// identity is meaningful only for a response that otherwise succeeded;
+						// checking an error envelope can mask a retryable 401/429/5xx.
+						if (expectedModelForVerification && !hasToolCall && !evt.message.errorMessage) {
 							const modelVerificationError = formatSubagentModelVerificationError(expectedModelForVerification, evt.message.model, options.availableModels, options.modelResponseAliases);
 							if (modelVerificationError && !result.error) result.error = modelVerificationError;
 						}
@@ -1581,6 +1590,9 @@ async function runSingleAttempt(
 	};
 	const remoteGitChanged = result.nativeMachine?.initialGit && result.nativeMachine.finalGit ? result.nativeMachine.initialGit.head !== result.nativeMachine.finalGit.head || result.nativeMachine.initialGit.dirty !== result.nativeMachine.finalGit.dirty : undefined;
 	const mutationEvidence = result.nativeMachine ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : collectTrackedMutationEvidence(mutationSnapshot, options.cwd ?? runtimeCwd);
+	if (mutationEvidence.attemptedMutation || mutationEvidence.changedFiles.length > 0) {
+		(result as ZeroProgressSingleResult)[ZERO_PROGRESS_MUTATION_OBSERVED] = true;
+	}
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	let fullOutput = stripAcceptanceReport(acceptanceOutput);
@@ -1821,13 +1833,26 @@ async function runSyncCompletionInner(
 			origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
 		},
 	);
-	const accountFallbackCandidates = applyForkThinkingToCandidates(
-		resolveSameModelAccountFallbacks(selectedModel, agent.fallbackModels, options.availableModels, agent.modelProvider ?? options.preferredModelProvider, { scope: options.modelScope }),
+	const resolvedFallbacks = resolveZeroProgressFallbackModels(
+		selectedModel,
+		agent.fallbackModels,
+		options.availableModels,
+		agent.modelProvider ?? options.preferredModelProvider,
+		{ scope: options.modelScope },
+	);
+	const fallbackCandidates = applyForkThinkingToCandidates(
+		resolvedFallbacks,
 		{ sanitized: options.forkSanitized === true, availableModels: options.availableModels, preferredProvider: agent.modelProvider ?? options.preferredModelProvider },
-	).map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
+	);
+	// Preserve the primary launch's existing fork-thinking contract. Per-candidate
+	// sanitization applies only when a fallback is selected.
+	const modelCandidates = [selectedModel, ...fallbackCandidates]
 		.filter((candidate): candidate is string => Boolean(candidate));
+	const modelsToTry = modelCandidates.length > 0
+		? modelCandidates.map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
+		: [undefined];
 	try {
-		for (const model of [applyThinkingSuffix(selectedModel, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined), ...accountFallbackCandidates]) {
+		for (const model of modelsToTry) {
 			assertThinkingWithinCeiling({ model, configThinking: options.thinkingOverride ?? agent.thinking, ceiling: options.thinkingCeiling, agent: agent.name, runId: options.runId });
 		}
 	} catch (error) {
@@ -1910,10 +1935,9 @@ async function runSyncCompletionInner(
 			return accepted;
 		},
 	};
-	const candidate = selectedModel;
-	const verifyModel = Boolean(candidate) && !options.modelOverrideFromParent;
 	let lastResult: SingleResult | undefined;
-	let recoveryPrompt = task;
+	const attemptedModels: string[] = [];
+	const modelAttempts: ModelAttempt[] = [];
 	let stagedIndexBaseline: string | undefined;
 	if (effectiveAcceptance.preserveStagedIndex) {
 		try {
@@ -1930,75 +1954,136 @@ async function runSyncCompletionInner(
 			}, options.context));
 		}
 	}
-	for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
-		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
-		const attemptResult = await runSingleAttempt(runtimeCwd, agent, recoveryPrompt, candidate, attemptOptions, {
-			sessionEnabled,
-			systemPrompt,
-			acceptancePrompt,
-			resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
-			skillsWarning: missingSkills.length > 0 ? `Skills not found: ${missingSkills.join(", ")}` : undefined,
-			jsonlPath,
-			artifactPaths: artifactPathsResult,
-			transcriptWriter,
-			attemptNotes,
-			outputSnapshot,
-			originalTask: task,
-			orcaProgressTab,
-			launchWarnings,
-			verifyModel,
-			accountFallbackCandidates,
-		});
-		lastResult = attemptResult;
-		sumUsage(aggregateUsage, attemptResult.usage);
-		totalToolCount += attemptResult.progressSummary?.toolCount ?? 0;
-		totalDurationMs += attemptResult.progressSummary?.durationMs ?? 0;
-		if (attemptResult.exitCode === 0 && !attemptResult.error) break;
-		const recovery = planAbortRecovery({
-			messages: attemptResult.messages ?? [],
-			error: attemptResult.error,
-			processSignal: attemptResult.processSignal,
-			sessionAvailable: Boolean(options.sessionFile && existsSync(options.sessionFile)),
-			alreadyResumed: attemptIndex > 0,
-			stopped: attemptResult.stopped || attemptResult.detached || Boolean(detachedReason) || Boolean(options.workflowChildPermitLaunch) || options.signal?.aborted,
-			interrupted: attemptResult.interrupted || options.interruptSignal?.aborted,
-			timedOut: attemptResult.timedOut,
-			toolBudgetExhausted: attemptResult.toolBudgetBlocked,
-			usageBudgetExhausted: false,
-			structuredOutputFailed: attemptResult.structuredOutputFailed,
-			acceptanceFailed: false,
-			currentTool: attemptResult.progress?.currentTool,
-			afterCompactionSettlement: (attemptResult as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT],
-		});
-		if (recovery.action === "resume") {
-			recoveryPrompt = recovery.prompt;
-			attemptNotes.push("[abort-recovery] compaction abort after useful progress; resuming the retained child session once on the same model.");
-			continue;
+	modelAttemptsLoop: for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
+		const candidate = modelsToTry[modelIndex];
+		const verifyModel = Boolean(candidate) && !(options.modelOverrideFromParent && modelIndex === 0);
+		const accountFallbackCandidates = modelsToTry.slice(modelIndex + 1)
+			.filter((next): next is string => Boolean(next) && isSameModelAccountFallback(candidate, next));
+		let recoveryPrompt = task;
+		let candidateResult: SingleResult | undefined;
+		let recoveryDiagnostic: string | undefined;
+		for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
+			const attemptResult = await runSingleAttempt(runtimeCwd, agent, recoveryPrompt, candidate, attemptOptions, {
+				sessionEnabled,
+				systemPrompt,
+				acceptancePrompt,
+				resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
+				skillsWarning: missingSkills.length > 0 ? `Skills not found: ${missingSkills.join(", ")}` : undefined,
+				jsonlPath,
+				artifactPaths: artifactPathsResult,
+				transcriptWriter,
+				attemptNotes,
+				outputSnapshot,
+				originalTask: task,
+				orcaProgressTab,
+				launchWarnings,
+				verifyModel,
+				accountFallbackCandidates,
+			});
+			candidateResult = attemptResult;
+			lastResult = attemptResult;
+			sumUsage(aggregateUsage, attemptResult.usage);
+			totalToolCount += attemptResult.progressSummary?.toolCount ?? 0;
+			totalDurationMs += attemptResult.progressSummary?.durationMs ?? 0;
+			if (attemptResult.exitCode === 0 && !attemptResult.error) break;
+			const usageBudgetExhausted = usageBudgetState(options.usageBudget, {
+				inputTokens: aggregateUsage.input,
+				outputTokens: aggregateUsage.output,
+				costUsd: aggregateUsage.cost,
+			})?.exhausted === true;
+			const recovery = planAbortRecovery({
+				messages: attemptResult.messages ?? [],
+				error: attemptResult.error,
+				processSignal: attemptResult.processSignal,
+				sessionAvailable: Boolean(options.sessionFile && existsSync(options.sessionFile)),
+				alreadyResumed: attemptIndex > 0,
+				stopped: attemptResult.stopped || attemptResult.detached || Boolean(detachedReason) || Boolean(options.workflowChildPermitLaunch) || options.signal?.aborted,
+				interrupted: attemptResult.interrupted || options.interruptSignal?.aborted,
+				timedOut: attemptResult.timedOut,
+				toolBudgetExhausted: attemptResult.toolBudgetBlocked,
+				usageBudgetExhausted,
+				structuredOutputFailed: attemptResult.structuredOutputFailed,
+				acceptanceFailed: false,
+				currentTool: attemptResult.progress?.currentTool,
+				afterCompactionSettlement: (attemptResult as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT],
+			});
+			if (recovery.action === "resume") {
+				recoveryPrompt = recovery.prompt;
+				attemptNotes.push("[abort-recovery] compaction abort after useful progress; resuming the retained child session once on the same model.");
+				continue;
+			}
+			recoveryDiagnostic = recovery.diagnostic;
+			break;
 		}
-		if (recovery.diagnostic) {
-			attemptResult.error = attemptResult.error ? `${attemptResult.error}\n${recovery.diagnostic}` : recovery.diagnostic;
+		if (!candidateResult) break;
+		const accountFallback = sameSessionAccountFallbackByResult.get(candidateResult);
+		if (accountFallback) {
+			attemptedModels.push(...accountFallback.attemptedCandidates);
+			modelAttempts.push(...accountFallback.failedAttempts);
+		} else {
+			attemptedModels.push(candidate ?? candidateResult.model ?? "default");
 		}
-		break;
+		const failedAccountUsage = accountFallback?.failedAttempts.reduce((total, attempt) => {
+			sumUsage(total, attempt.usage);
+			return total;
+		}, emptyUsage()) ?? emptyUsage();
+		modelAttempts.push({
+			model: accountFallback?.attemptedCandidates.at(-1) ?? candidate ?? candidateResult.model ?? "default",
+			success: candidateResult.exitCode === 0 && !candidateResult.error,
+			exitCode: candidateResult.exitCode,
+			...(candidateResult.error ? { error: candidateResult.error } : {}),
+			usage: accountFallback ? usageSince(candidateResult.usage, failedAccountUsage) : { ...candidateResult.usage },
+		});
+		if (candidateResult.exitCode === 0 && !candidateResult.error) break modelAttemptsLoop;
+		if (isContextOverflow(candidateResult.error)) {
+			candidateResult.contextOverflow = true;
+			break modelAttemptsLoop;
+		}
+		const nextModel = modelsToTry[modelIndex + 1];
+		const usageBudgetExhausted = usageBudgetState(options.usageBudget, {
+			inputTokens: aggregateUsage.input,
+			outputTokens: aggregateUsage.output,
+			costUsd: aggregateUsage.cost,
+		})?.exhausted === true;
+		const zeroProgressFallback = Boolean(nextModel)
+			&& !candidateResult.stopped
+			&& !candidateResult.detached
+			&& !candidateResult.interrupted
+			&& !candidateResult.timedOut
+			&& !candidateResult.toolBudgetBlocked
+			&& !usageBudgetExhausted
+			&& !candidateResult.structuredOutputFailed
+			&& !candidateResult.progress?.currentTool
+			&& !(candidateResult.controlEvents?.length)
+			&& !(candidateResult as ZeroProgressSingleResult)[ZERO_PROGRESS_MUTATION_OBSERVED]
+			&& !detachedReason
+			&& !options.signal?.aborted
+			&& !options.interruptSignal?.aborted
+			&& !options.workflowChildPermitLaunch
+			&& isZeroProgressModelFailureAttempt({
+				error: candidateResult.error,
+				messages: candidateResult.messages,
+				toolCount: candidateResult.progressSummary?.toolCount,
+			});
+		if (!zeroProgressFallback || !nextModel) {
+			if (recoveryDiagnostic) {
+				candidateResult.error = candidateResult.error ? `${candidateResult.error}\n${recoveryDiagnostic}` : recoveryDiagnostic;
+				modelAttempts[modelAttempts.length - 1]!.error = candidateResult.error;
+			}
+			break modelAttemptsLoop;
+		}
+		attemptNotes.push(formatZeroProgressFallbackNote(candidate ?? candidateResult.model ?? "default", candidateResult.error, nextModel));
 	}
 	if (!lastResult) throw new Error("Subagent did not produce a result.");
-	const accountFallback = sameSessionAccountFallbackByResult.get(lastResult);
-	if (accountFallback) {
-		lastResult.attemptedModels = [...accountFallback.attemptedCandidates];
-		lastResult.modelAttempts = [
-			...accountFallback.failedAttempts,
-			{
-				model: accountFallback.attemptedCandidates.at(-1) ?? lastResult.model ?? selectedModel ?? "default",
-				success: lastResult.exitCode === 0 && !lastResult.error,
-				exitCode: lastResult.exitCode,
-				...(lastResult.error ? { error: lastResult.error } : {}),
-				usage: usageSince(lastResult.usage, accountFallback.failedAttempts.reduce((total, attempt) => {
-					sumUsage(total, attempt.usage);
-					return total;
-				}, emptyUsage())),
-			},
-		];
+	const exposeModelAttempts = modelsToTry.length > 1 || modelAttempts.length > 1;
+	if (exposeModelAttempts) {
+		lastResult.attemptedModels = attemptedModels;
+		lastResult.modelAttempts = modelAttempts;
+	} else {
+		delete lastResult.attemptedModels;
+		delete lastResult.modelAttempts;
 	}
-	if (isContextOverflow(lastResult.error)) lastResult.contextOverflow = true;
 
 	const result = withRunContext(lastResult ?? {
 		index: options.index ?? 0,

@@ -5,6 +5,7 @@ import {
 	formatSubagentModelVerificationError,
 	fuzzyResolveModel,
 	isContextOverflow,
+	isZeroProgressModelFailureAttempt,
 	normalizeModelSegment,
 	normalizeParentModel,
 	resolveEffectiveSubagentModel,
@@ -12,6 +13,7 @@ import {
 	resolveModelSelection,
 	resolveSameModelAccountFallbacks,
 	resolveSubagentModelOverride,
+	resolveZeroProgressFallbackModels,
 } from "../../src/runs/shared/model-resolution.ts";
 import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
 
@@ -93,6 +95,26 @@ describe("single model resolution", () => {
 		assert.throws(() => resolveModelSelection("openai/gpt-5-mini", models, undefined, { scope: strict, origin: "inherited" }), /outside the configured subagent model scope/);
 	});
 
+	it("resolves ordered different-model fallbacks for zero-progress retries", () => {
+		const registry = [
+			...models,
+			{ provider: "devin", id: "swe-2", fullId: "devin/swe-2" },
+		];
+		assert.deepEqual(resolveZeroProgressFallbackModels(
+			"openai/gpt-5-mini",
+			["devin/swe-2:high", "anthropic/claude-sonnet-4", "openai/gpt-5-mini", "missing/model"],
+			registry,
+		), ["devin/swe-2:high", "anthropic/claude-sonnet-4"]);
+		const strictScope = resolveModelScopesForAgent({ enforce: true, strict: true, allow: ["openai/*"] }, "worker", undefined);
+		assert.throws(() => resolveZeroProgressFallbackModels(
+			"openai/gpt-5-mini",
+			["anthropic/claude-sonnet-4"],
+			registry,
+			undefined,
+			{ scope: strictScope },
+		), /outside the configured subagent model scope/);
+	});
+
 	it("keeps only configured exact-model account aliases for live continuation", () => {
 		const registry = [
 			...models,
@@ -123,6 +145,42 @@ describe("single model resolution", () => {
 	it("fails closed when enforced inherit has no parent model", () => {
 		const scope = resolveModelScopesForAgent({ allow: ["inherit"], enforce: true }, "worker", undefined);
 		assert.throws(() => resolveModelSelection(undefined, models, undefined, { scope }), /'inherit' requires a current parent session model/);
+	});
+});
+
+describe("zero-progress fallback admission", () => {
+	it("admits terminal provider errors including HTTP 401 before output or tools", () => {
+		const error = "OpenAI API error (401): invalid_api_key";
+		assert.equal(isZeroProgressModelFailureAttempt({
+			error,
+			toolCount: 0,
+			messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: error }],
+		}), true);
+		assert.equal(isZeroProgressModelFailureAttempt({ error: "model_verification_failed: wrong route", messages: [], toolCount: 0 }), true);
+		assert.equal(isZeroProgressModelFailureAttempt({
+			error: "novel provider failure",
+			messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "novel provider failure" }],
+			toolCount: 0,
+		}), true);
+	});
+
+	it("rejects useful output, tool history, and tool-originated failures", () => {
+		assert.equal(isZeroProgressModelFailureAttempt({
+			error: "401 invalid_api_key",
+			toolCount: 0,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "error", errorMessage: "401 invalid_api_key" }],
+		}), false);
+		assert.equal(isZeroProgressModelFailureAttempt({ error: "401 invalid_api_key", messages: [], toolCount: 1 }), false);
+		assert.equal(isZeroProgressModelFailureAttempt({ error: "bash failed (exit 1): network error", messages: [], toolCount: 0 }), false);
+		assert.equal(isZeroProgressModelFailureAttempt({
+			error: "401 invalid_api_key",
+			toolCount: 0,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "Task: original" }] },
+				{ role: "user", content: [{ type: "text", text: "Steer: revised scope" }] },
+				{ role: "assistant", content: [], stopReason: "error", errorMessage: "401 invalid_api_key" },
+			],
+		}), false);
 	});
 });
 

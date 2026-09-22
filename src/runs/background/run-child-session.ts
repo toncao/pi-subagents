@@ -537,7 +537,10 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				const hasToolCall = assistantStartsToolCall(event.message);
 				if (event.message.model) {
 					model = event.message.model;
-					if (expectedModelForVerification && !hasToolCall) {
+					// Error envelopes may report a shortened or placeholder model id.
+					// Preserve their provider error for zero-progress fallback instead of
+					// replacing it with a response-identity diagnostic.
+					if (expectedModelForVerification && !hasToolCall && !event.message.errorMessage) {
 						const modelVerificationError = formatSubagentModelVerificationError(expectedModelForVerification, event.message.model, input.modelVerificationRegistry, input.modelResponseAliases);
 						if (modelVerificationError && !error) error = modelVerificationError;
 					}

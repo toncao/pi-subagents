@@ -465,9 +465,143 @@ export function resolveModelSelection(
 	return { ...(resolved ? { model: resolved } : {}), ...(requestedModel ? { requestedModel } : {}) };
 }
 
-// Request-shape failures can match broad fallback signals such as "upstream",
-// but do not establish that the model is unhealthy for subsequent requests.
-const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
+/** Resolve the ordered different-model/provider candidates that may be tried only
+ * after a verified zero-progress failure. Unknown candidates are skipped, model
+ * scope is enforced, and the primary is never returned again. */
+export function resolveZeroProgressFallbackModels(
+	primaryModel: string | undefined,
+	fallbackModels: readonly string[] | undefined,
+	availableModels: AvailableModelInfo[] | undefined,
+	preferredProvider?: string,
+	options?: { scope?: ModelScopeCheckRule | ModelScopeCheckRule[]; onWarn?: (violation: ModelScopeViolation) => void },
+): string[] {
+	if (!fallbackModels?.length) return [];
+	const seen = new Set<string>();
+	if (primaryModel) seen.add(splitThinkingSuffix(primaryModel).baseModel);
+	const resolved: string[] = [];
+	for (const fallback of fallbackModels) {
+		const candidate = resolveSubagentModelCandidate(fallback, availableModels, preferredProvider);
+		if (!candidate) {
+			console.warn(`[pi-subagents] Skipping fallback model '${fallback}' because it is unavailable in this environment.`);
+			continue;
+		}
+		const key = splitThinkingSuffix(candidate).baseModel;
+		if (seen.has(key)) continue;
+		enforceModelScopes(candidate, options?.scope, "inherited", options?.onWarn);
+		seen.add(key);
+		resolved.push(candidate);
+	}
+	return resolved;
+}
+
+const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+const ZERO_PROGRESS_MODEL_FAILURE_PATTERNS = [
+	/model_verification_failed/i,
+	/^REQUEST_LIMIT_EXCEEDED$/,
+	/\b40[13]\b/,
+	/\b429\b/,
+	/\b5\d\d\b/,
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/quota/i,
+	/billing/i,
+	/credit/i,
+	/auth(?:entication)?/i,
+	/unauthori[sz]ed/i,
+	/forbidden/i,
+	/api key/i,
+	/token expired/i,
+	/invalid key/i,
+	/provider.*unavailable/i,
+	/model.*(?:unavailable|disabled|not found|load|fail|error)/i,
+	/unknown model/i,
+	/overloaded/i,
+	/service unavailable/i,
+	/temporar(?:ily)? unavailable/i,
+	/connection\s+(?:error|reset|closed|aborted|refused)/i,
+	/fetch failed/i,
+	/network error/i,
+	/socket hang up/i,
+	/stream ended without finish_reason/i,
+	/upstream/i,
+	/timed? out/i,
+	/timeout/i,
+	/internal server error/i,
+	/cold.?start/i,
+	/empty response/i,
+	/no output/i,
+];
+
+function messageHasUsefulProgress(message: unknown): boolean {
+	if (!message || typeof message !== "object") return false;
+	const value = message as { role?: unknown; content?: unknown };
+	if (value.role === "toolResult") return true;
+	if (value.role !== "assistant" || !Array.isArray(value.content)) return false;
+	return value.content.some((part) => {
+		if (!part || typeof part !== "object") return true;
+		const typed = part as { type?: unknown; text?: unknown };
+		if (typed.type === "text") return typeof typed.text !== "string" || typed.text.trim().length > 0;
+		return true;
+	});
+}
+
+function hasPostLaunchUserInput(messages: readonly unknown[]): boolean {
+	let initialTaskSeen = false;
+	for (const message of messages) {
+		if (!message || typeof message !== "object") continue;
+		const value = message as { role?: unknown; content?: unknown };
+		if (value.role !== "user") continue;
+		const text = typeof value.content === "string"
+			? value.content
+			: Array.isArray(value.content)
+				? value.content.map((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" ? (part as { text?: unknown }).text : "").filter((part): part is string => typeof part === "string").join("\n")
+				: "";
+		if (!initialTaskSeen && text.startsWith("Task: ")) {
+			initialTaskSeen = true;
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+/** Admit a new different-model attempt only before the child has produced any
+ * useful output or tool history. A trusted terminal provider error is eligible
+ * regardless of status text; launch-time failures without a terminal message
+ * must match a bounded provider/model pattern. */
+export function isZeroProgressModelFailureAttempt(input: {
+	error?: string;
+	messages?: readonly unknown[];
+	toolCount?: number;
+}): boolean {
+	if (!input.error || TOOL_FAILURE_PREFIX.test(input.error.trim()) || (input.toolCount ?? 0) > 0) return false;
+	const messages = input.messages ?? [];
+	if (hasPostLaunchUserInput(messages) || messages.some(messageHasUsefulProgress)) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object") continue;
+		const terminal = message as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+		if (terminal.role !== "assistant") continue;
+		if (terminal.stopReason === "error" && typeof terminal.errorMessage === "string" && terminal.errorMessage.trim()) {
+			return terminal.errorMessage.trim() === input.error.trim();
+		}
+		break;
+	}
+	return ZERO_PROGRESS_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(input.error!));
+}
+
+export function formatZeroProgressFallbackNote(model: string, error: string | undefined, nextModel: string): string {
+	const status = error?.match(/\b(?:40[13]|429|5\d\d)\b/)?.[0];
+	const category = status
+		? `HTTP ${status}`
+		: /model_verification_failed/i.test(error ?? "")
+			? "model verification failure"
+			: /rate\s*limit|usage\s*limit|quota/i.test(error ?? "")
+				? "rate/quota failure"
+				: "provider/model failure";
+	return `[fallback] ${model} failed before producing output or tools (${category}). Retrying the original task with ${nextModel}.`;
+}
 
 /** A deliberately small user message: the existing transcript carries the task and completed tool results. */
 export const SAME_SESSION_ACCOUNT_FALLBACK_NOTICE =
@@ -593,6 +727,6 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 
 export function isContextOverflow(error: string | undefined): boolean {
 	if (!error) return false;
-	if (/^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i.test(error.trim())) return false;
+	if (TOOL_FAILURE_PREFIX.test(error.trim())) return false;
 	return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(error));
 }
