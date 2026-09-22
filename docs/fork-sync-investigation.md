@@ -6,9 +6,11 @@ no account identifiers, credentials, request payloads, or machine-local paths.
 
 ## Safety boundary
 
-Validation is synthetic and offline (`PI_OFFLINE=1`, provider environment removed,
-temporary test roots). No credential rotation, account-order change, live inference,
-or provider health probe is part of this change. A separate Pi repository validation
+Validation is synthetic and offline (`PI_OFFLINE=1`, temporary test roots, and fake
+child/provider responses in the selected suites). The inherited process environment
+was not comprehensively scrubbed, so this is not evidence of credential isolation.
+No credential rotation, account-order change, live inference, or provider health
+probe is part of this change. A separate Pi repository validation
 ran a model-catalog hydration command that contacted public catalog endpoints; that
 side effect is not evidence about this package or provider health and must not be
 reported as an offline provider check.
