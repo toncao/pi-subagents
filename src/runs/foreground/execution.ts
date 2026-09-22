@@ -1822,7 +1822,7 @@ async function runSyncCompletionInner(
 		},
 	);
 	const accountFallbackCandidates = applyForkThinkingToCandidates(
-		resolveSameModelAccountFallbacks(selectedModel, agent.fallbackModels, options.availableModels, agent.modelProvider ?? options.preferredModelProvider),
+		resolveSameModelAccountFallbacks(selectedModel, agent.fallbackModels, options.availableModels, agent.modelProvider ?? options.preferredModelProvider, { scope: options.modelScope }),
 		{ sanitized: options.forkSanitized === true, availableModels: options.availableModels, preferredProvider: agent.modelProvider ?? options.preferredModelProvider },
 	).map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
 		.filter((candidate): candidate is string => Boolean(candidate));

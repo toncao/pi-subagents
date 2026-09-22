@@ -514,12 +514,14 @@ export function resolveSameModelAccountFallbacks(
 	fallbackModels: readonly string[] | undefined,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
+	options?: { scope?: ModelScopeCheckRule | ModelScopeCheckRule[]; onWarn?: (violation: ModelScopeViolation) => void },
 ): string[] {
 	if (!currentModel || !fallbackModels?.length || !availableModels?.length) return [];
 	const resolved: string[] = [];
 	for (const fallback of fallbackModels) {
 		const candidate = resolveSubagentModelCandidate(fallback, availableModels, preferredProvider);
 		if (!candidate || !isSameModelAccountFallback(currentModel, candidate)) continue;
+		enforceModelScopes(candidate, options?.scope, "inherited", options?.onWarn);
 		if (!resolved.includes(candidate)) resolved.push(candidate);
 	}
 	return resolved;

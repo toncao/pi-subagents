@@ -1018,6 +1018,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		if (externalRunner) {
 			const unsupported: string[] = [];
 			if (s.model !== undefined) unsupported.push("model override");
+			if (a.fallbackModels?.length) unsupported.push("fallback models");
 			if (effectiveBehavior.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
@@ -1130,6 +1131,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			a.fallbackModels,
 			availableModels,
 			a.modelProvider,
+			{ scope: modelScopes },
 		).map((candidate) => applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined))
 			.filter((candidate): candidate is string => Boolean(candidate));
 		for (const model of accountFallbackModels) assertThinkingWithinCeiling({ model, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
@@ -1760,6 +1762,7 @@ export function executeAsyncSingle(
 	if (externalRunner) {
 		const unsupported: string[] = [];
 		if (params.modelOverride !== undefined) unsupported.push("model override");
+		if (agentConfig.fallbackModels?.length) unsupported.push("fallback models");
 		if ((params.fast ?? agentConfig.fast) === true) unsupported.push("fast mode");
 		if (params.thinkingOverride !== undefined) unsupported.push("thinking override");
 		if (params.structuredOutputSchema !== undefined) unsupported.push("structured output");
@@ -1942,7 +1945,7 @@ export function executeAsyncSingle(
 		}
 	}
 	const accountFallbackModels = externalRunner ? [] : applyForkThinkingToCandidates(
-		resolveSameModelAccountFallbacks(selectedModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider),
+		resolveSameModelAccountFallbacks(selectedModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, { scope: modelScopes }),
 		forkThinkingPolicy,
 	).map((candidate) => applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined))
 		.filter((candidate): candidate is string => Boolean(candidate));

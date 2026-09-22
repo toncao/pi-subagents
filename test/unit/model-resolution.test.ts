@@ -110,6 +110,14 @@ describe("single model resolution", () => {
 			["azure-openai-responses/gpt-5-mini"],
 			registry,
 		), [], "provider families that merely share a model id are not interchangeable");
+		const strictScope = resolveModelScopesForAgent({ enforce: true, strict: true, allow: ["anthropic/claude-sonnet-4"] }, "worker", undefined);
+		assert.throws(() => resolveSameModelAccountFallbacks(
+			"anthropic/claude-sonnet-4",
+			["anthropic-2/claude-sonnet-4"],
+			registry,
+			undefined,
+			{ scope: strictScope },
+		), /outside the configured subagent model scope/);
 	});
 
 	it("fails closed when enforced inherit has no parent model", () => {

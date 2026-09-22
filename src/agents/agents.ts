@@ -2037,7 +2037,7 @@ function parseAgentRunnerFrontmatter(raw: string | undefined, agentName: string)
 
 function validateExternalRunnerProfile(frontmatter: Record<string, string>, agentName: string, runner: AgentRunnerConfig | undefined): void {
 	if (runner?.type !== "external-cli" && runner?.type !== "external-job") return;
-	const unsupported = ["tools", "excludeTools", "allowNestedSubagents", "allowedAgents", "model", "thinking", "extensions", "subagentOnlyExtensions", "mutationTools", "maxSubagentDepth", "skills", "skill", "skillPath", "toolBudget", "permission", "permissions"]
+	const unsupported = ["tools", "excludeTools", "allowNestedSubagents", "allowedAgents", "model", "fallbackModels", "thinking", "extensions", "subagentOnlyExtensions", "mutationTools", "maxSubagentDepth", "skills", "skill", "skillPath", "toolBudget", "permission", "permissions"]
 		.filter((field) => frontmatter[field] !== undefined);
 	if (unsupported.length > 0) {
 		throw new Error(`Agent '${agentName}' uses runner.type='${runner.type}' and declares unsupported Pi-only fields: ${unsupported.join(", ")}.`);
