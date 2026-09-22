@@ -385,6 +385,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			scope: modelScopes,
 			primaryModelFromParent: modelOrigin === "inherited" || inheritsParentModel(input.model, agent.model, input.parentModel),
 			origin: modelOrigin,
+			fallbackModels: context === "fork" ? undefined : agent.fallbackModels,
 		}).model, effectiveThinkingConfig, input.thinking !== undefined);
 	if (!externalRunner) {
 		try {

@@ -192,6 +192,37 @@ describe("in-process foreground child", () => {
 		assert.equal(mockPi.sessions[0]?.disposed, true);
 	});
 
+	it("skips an unregistered configured primary without inventing a model attempt", async () => {
+		mockPi.onCall({ output: "registered fallback completed" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "openai/placeholder",
+			fallbackModels: ["missing/also", "devin/swe-2:high", "devin/swe-2:low"],
+		})], "worker", "Perform once", {
+			runId: "unregistered-primary-fallback",
+			sessionFile: path.join(tempDir, "new-child.jsonl"),
+			forkSanitized: true,
+			availableModels: [{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2", api: "openai-completions" }],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.requestedModel, "openai/placeholder");
+		assert.equal(mockPi.sessions.length, 1);
+		assert.equal(mockPi.sessions[0]?.launch.model, "devin/devin/swe-2:high");
+		assert.equal(mockPi.sessions[0]?.task, "Task: Perform once");
+		assert.ok(!result.attemptedModels?.includes("openai/placeholder"));
+	});
+
+	it("does not replace an unregistered model for an existing child session", async () => {
+		const sessionFile = path.join(tempDir, "retained-session.jsonl");
+		fs.writeFileSync(sessionFile, "");
+		await assert.rejects(runSync(tempDir, [makeAgent("worker", {
+			model: "openai/placeholder", fallbackModels: ["devin/swe-2"],
+		})], "worker", "Continue", {
+			runId: "retained-unregistered-primary", sessionFile,
+			availableModels: [{ provider: "devin", id: "swe-2", fullId: "devin/swe-2" }],
+		}), /Unknown subagent model/);
+		assert.equal(mockPi.sessions.length, 0);
+	});
+
 	it("falls back to a different model after a zero-progress HTTP 401", async () => {
 		const primary = "openai/placeholder";
 		const fallback = "devin/swe-2";

@@ -251,6 +251,17 @@ Project prompt.
 		if (openrouter.ok) assert.equal(openrouter.contract.model, "openrouter/openai/gpt-5-mini:high");
 	});
 
+	it("binds a registered configured fallback when the primary is missing", async () => {
+		const cwd = path.join(tempDir, "fallback-repo");
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Fallback worker\nmodel: openai/placeholder\nfallbackModels: missing/also, devin/swe-2:high\n---\nWorker.\n");
+		const result = await resolveSubagentLaunchContract({
+			agent: "worker", cwd, task: "Inspect",
+			availableModels: [{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" }],
+		});
+		assert.equal(result.ok, true, JSON.stringify(result));
+		if (result.ok) assert.equal(result.contract.model, "devin/devin/swe-2:high");
+	});
+
 	it("warns when workspace package work has package-only authority", async () => {
 		const cwd = path.join(tempDir, "workspace-scope-repo");
 		fs.mkdirSync(cwd, { recursive: true });

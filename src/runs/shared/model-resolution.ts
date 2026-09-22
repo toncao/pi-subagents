@@ -6,6 +6,8 @@ export type { AvailableModelInfo };
 export interface ModelSelectionEvidence {
 	model?: string;
 	requestedModel?: string;
+	/** Registry selection only: no child request was made for the missing primary. */
+	fallbackSelected?: true;
 }
 
 export { splitThinkingSuffix };
@@ -415,6 +417,8 @@ export interface ResolveModelSelectionOptions {
 	primaryModelFromParent?: boolean;
 	/** How the model was selected. */
 	origin?: ModelOrigin;
+	/** Used only when a configured (not explicit or inherited) primary is unregistered. */
+	fallbackModels?: readonly string[];
 }
 
 export function resolveModelOrigin(input: {
@@ -455,6 +459,17 @@ export function resolveModelSelection(
 		const normalized = resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider);
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		model = normalized;
+	}
+	// An absent configured primary fails before the runtime retry loop can run.
+	// Resolve the existing ordered fallbacks here instead; never catch scope errors
+	// or reinterpret an explicit pin / inherited model as permission to switch.
+	if (model && origin === "configured" && !options?.primaryModelFromParent
+		&& !resolveSubagentModelCandidate(model.trim(), availableModels, preferredProvider)) {
+		const fallback = resolveZeroProgressFallbackModels(model, options?.fallbackModels, availableModels, preferredProvider, options)[0];
+		if (fallback) {
+			console.warn(`[pi-subagents] Configured model '${model}' is unavailable in this environment; selecting fallback '${fallback}' before child launch.`);
+			return { model: fallback, requestedModel, fallbackSelected: true };
+		}
 	}
 	const resolved = model && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
 		? model.trim()

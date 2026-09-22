@@ -1823,7 +1823,7 @@ async function runSyncCompletionInner(
 	}
 	const systemPrompt = buildEffectiveSystemPrompt({ agent, resolvedSkills, cwd: skillCwd, ...(options.outputPath ? { outputPath: options.outputPath } : {}) });
 
-	const { model: selectedModel, requestedModel } = resolveModelSelection(
+	const { model: selectedModel, requestedModel, fallbackSelected } = resolveModelSelection(
 		options.modelOverride ?? agent.model,
 		options.availableModels,
 		agent.modelProvider ?? options.preferredModelProvider,
@@ -1831,6 +1831,7 @@ async function runSyncCompletionInner(
 			scope: options.modelScope,
 			primaryModelFromParent: options.modelOverrideFromParent,
 			origin: options.modelOrigin ?? (options.modelOverrideFromParent ? "inherited" : "configured"),
+			fallbackModels: options.sessionFile && existsSync(options.sessionFile) ? undefined : agent.fallbackModels,
 		},
 	);
 	const resolvedFallbacks = resolveZeroProgressFallbackModels(
@@ -1846,7 +1847,10 @@ async function runSyncCompletionInner(
 	);
 	// Preserve the primary launch's existing fork-thinking contract. Per-candidate
 	// sanitization applies only when a fallback is selected.
-	const modelCandidates = [selectedModel, ...fallbackCandidates]
+	const launchPrimary = fallbackSelected && selectedModel
+		? applyForkThinkingToCandidates([selectedModel], { sanitized: options.forkSanitized === true, availableModels: options.availableModels, preferredProvider: agent.modelProvider ?? options.preferredModelProvider })[0]
+		: selectedModel;
+	const modelCandidates = [launchPrimary, ...fallbackCandidates]
 		.filter((candidate): candidate is string => Boolean(candidate));
 	const modelsToTry = modelCandidates.length > 0
 		? modelCandidates.map((candidate) => applyThinkingSuffix(candidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))

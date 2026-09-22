@@ -1084,6 +1084,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel);
 		const modelOrigin = resolveModelOrigin({ explicitModel: s.model, agentModel: a.model, parentModel: ctx.currentModel });
 		const primaryModelFromParent = modelOrigin === "inherited";
+		const existingSessionFile = flatIndex === undefined ? undefined : sessionFilesByFlatIndex?.[flatIndex];
 		const primaryModel = externalRunner ? undefined : resolveEffectiveSubagentModel(
 			s.model,
 			a.model,
@@ -1095,7 +1096,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const thinkingOverride = flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex];
 		const effectiveThinking = externalRunner ? undefined : thinkingOverride ?? a.thinking;
 		const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
-		const contextLimit = model ? findModelInfo(model, availableModels, a.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
+		let contextLimit = model ? findModelInfo(model, availableModels, a.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
 		const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 			params.thinkingCeiling,
 			a.maxThinking,
@@ -1118,9 +1119,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					scope: modelScopes,
 					primaryModelFromParent,
 					origin: modelOrigin,
+					fallbackModels: existingSessionFile && fs.existsSync(existingSessionFile) ? undefined : a.fallbackModels,
 				});
 				requestedModel = modelEvidence.requestedModel;
 				selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, thinkingOverride !== undefined);
+				contextLimit = findModelInfo(selectedModel, availableModels, a.modelProvider ?? ctx.currentModelProvider)?.contextWindow;
 				assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
 			} catch (error) {
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
@@ -1905,7 +1908,7 @@ export function executeAsyncSingle(
 		preferredProvider: agentConfig.modelProvider ?? ctx.currentModelProvider,
 	};
 	const model = externalRunner ? undefined : applyThinkingSuffix(applyForkThinkingToModel(primaryModel, forkThinkingPolicy), effectiveThinking, params.thinkingOverride !== undefined);
-	const contextLimit = model ? findModelInfo(model, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
+	let contextLimit = model ? findModelInfo(model, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		params.thinkingCeiling,
 		agentConfig.maxThinking,
@@ -1947,9 +1950,11 @@ export function executeAsyncSingle(
 				scope: modelScopes,
 				primaryModelFromParent: modelOrigin === "inherited",
 				origin: modelOrigin,
+				fallbackModels: params.sessionFile && fs.existsSync(params.sessionFile) ? undefined : agentConfig.fallbackModels,
 			});
 			requestedModel = modelEvidence.requestedModel;
-			selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, params.thinkingOverride !== undefined);
+			selectedModel = applyThinkingSuffix(modelEvidence.fallbackSelected ? applyForkThinkingToModel(modelEvidence.model, forkThinkingPolicy) : modelEvidence.model, effectiveThinking, params.thinkingOverride !== undefined);
+			contextLimit = findModelInfo(selectedModel, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider)?.contextWindow;
 			assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
 		} catch (error) {
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));

@@ -64,6 +64,49 @@ describe("single model resolution", () => {
 		assert.equal(resolveEffectiveSubagentModel("missing", "gpt-5-mini", undefined, models, undefined, { source: "inherited" }), "missing");
 	});
 
+	it("selects the first registered configured fallback before any child attempt", () => {
+		const registry = [...models, { provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" }];
+		const selection = resolveModelSelection("openai/placeholder", registry, undefined, {
+			fallbackModels: ["missing/also", "devin/swe-2:high", "anthropic/claude-sonnet-4"],
+		});
+		assert.equal(selection.model, "devin/devin/swe-2:high");
+		assert.equal(selection.requestedModel, "openai/placeholder");
+		assert.equal(selection.fallbackSelected, true);
+	});
+
+	it("does not replace an explicit pin, inherited model, or known configured primary", () => {
+		const fallbackModels = ["anthropic/claude-sonnet-4"];
+		assert.throws(() => resolveModelSelection("openai/placeholder", models, undefined, {
+			origin: "explicit", fallbackModels,
+		}), /Unknown subagent model/);
+		assert.equal(resolveModelSelection("openai/placeholder", models, undefined, {
+			origin: "inherited", fallbackModels,
+		}).model, "openai/placeholder");
+		assert.deepEqual(resolveModelSelection("gpt-5-mini", models, undefined, { fallbackModels }), {
+			model: "openai/gpt-5-mini", requestedModel: "gpt-5-mini",
+		});
+	});
+
+	it("fails closed without a usable fallback and never routes around scope denial", () => {
+		assert.throws(() => resolveModelSelection("openai/placeholder", models, undefined, {
+			fallbackModels: ["missing/also"],
+		}), /Unknown subagent model 'openai\/placeholder'/);
+		const scope = resolveModelScopesForAgent({ enforce: true, strict: true, allow: ["openai/*"] }, "worker", undefined);
+		for (const primary of ["openai/placeholder", "anthropic/claude-sonnet-4"]) {
+			assert.throws(() => resolveModelSelection(primary, models, undefined, {
+				scope, fallbackModels: ["anthropic/claude-sonnet-4", "openai/gpt-5-mini"],
+			}), /outside the configured subagent model scope/);
+		}
+	});
+
+	it("does not infer registry absence from a missing or empty catalog", () => {
+		for (const registry of [undefined, []]) {
+			assert.equal(resolveModelSelection("openai/placeholder", registry, undefined, {
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}).model, "openai/placeholder");
+		}
+	});
+
 	it("normalizes registry spelling without switching a qualified provider", () => {
 		assert.equal(normalizeModelSegment("GPT_5--MINI"), "gpt-5-mini");
 		assert.equal(fuzzyResolveModel("GPT_5_MINI", models), "openai/gpt-5-mini");
