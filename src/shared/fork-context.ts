@@ -4,9 +4,11 @@
 // thinking is not. Pi >= 0.85.0 recovers from signed-thinking mismatches on the
 // transport, so a sanitized transcript is safe to resume with thinking enabled and the
 // child keeps the level it asked for, reasoning fresh from its first turn.
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { findModelInfo, type ModelInfo } from "./model-info.ts";
 
 type SubagentExecutionContext = "fresh" | "fork";
 
@@ -23,6 +25,7 @@ interface BranchSessionEntry {
 		api?: string;
 		model?: string;
 	};
+	thinkingLevel?: string;
 }
 
 interface BranchSessionManager {
@@ -42,11 +45,27 @@ interface ForkContextResolverOptions {
 	openSession?: (path: string, sessionDir?: string) => BranchSessionManager;
 	/** Rewrite a created fork before its path can be used to spawn a child. */
 	pruneSession?: (sessionFile: string) => Promise<void>;
+	/** Decide per child index whether a sanitized transcript must also disable the child's
+	 * thinking. Defaults to false: Pi >= 0.85.0 recovers from signed-thinking mismatches
+	 * on the transport, so sanitization alone is not a reason to turn thinking off.
+	 * The executor passes an explicit gate so older Pi runtimes can stay conservative. */
+	forceThinkingOffForIndex?: (index: number) => boolean;
+}
+
+interface ForkContextResolution {
+	sessionFile: string;
+	thinkingOverride?: "off";
+	/** True when signed/redacted Anthropic thinking blocks were stripped from this fork. */
+	sanitized: boolean;
 }
 
 interface ForkContextResolver {
 	prepareSessionForIndex(index?: number): Promise<void>;
 	sessionFileForIndex(index?: number): string | undefined;
+	thinkingOverrideForIndex(index?: number): "off" | undefined;
+	/** Whether the fork transcript was sanitized, independent of the blanket thinking
+	 * decision. Callers use this to disable thinking per candidate instead of chain-wide. */
+	sanitizedForIndex(index?: number): boolean;
 }
 
 export function resolveSubagentContext(value: unknown): SubagentExecutionContext {
@@ -95,6 +114,42 @@ export function canPreferForkFromSnapshot(input: PreferredForkSnapshot): boolean
 	}
 }
 
+/** Decide whether a resolved child model uses Anthropic's provider or message API, which
+ * requires the sanitized fork to disable thinking. Unknown models stay conservative. */
+export function forkedChildRequiresThinkingOff(
+	model: string | undefined,
+	availableModels?: ModelInfo[],
+	preferredProvider?: string,
+): boolean {
+	if (!model) return true;
+	const info = findModelInfo(model, availableModels, preferredProvider);
+	if (!info) return true;
+	return info.provider.toLowerCase() === "anthropic"
+		|| info.api?.toLowerCase() === "anthropic-messages";
+}
+
+function createEntryId(entries: BranchSessionEntry[]): string {
+	const ids = new Set(entries.map((entry) => entry.id).filter((id): id is string => typeof id === "string"));
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const id = randomUUID().slice(0, 8);
+		if (!ids.has(id)) return id;
+	}
+	return randomUUID();
+}
+
+function appendThinkingOffEntry(entries: BranchSessionEntry[]): void {
+	const last = entries[entries.length - 1];
+	if (last?.type === "thinking_level_change" && last.thinkingLevel === "off") return;
+	const parent = [...entries].reverse().find((entry) => typeof entry.id === "string");
+	entries.push({
+		type: "thinking_level_change",
+		id: createEntryId(entries),
+		parentId: parent?.id ?? null,
+		timestamp: new Date().toISOString(),
+		thinkingLevel: "off",
+	});
+}
+
 function isUnsafeAnthropicThinkingBlock(message: BranchSessionEntry["message"], block: unknown): boolean {
 	if (!message || !block || typeof block !== "object" || !("type" in block)) return false;
 	const provider = typeof message.provider === "string" ? message.provider.toLowerCase() : "";
@@ -141,6 +196,8 @@ export function createForkContextResolver(
 		return {
 			prepareSessionForIndex: async () => {},
 			sessionFileForIndex: () => undefined,
+			thinkingOverrideForIndex: () => undefined,
+			sanitizedForIndex: () => false,
 		};
 	}
 
@@ -174,12 +231,12 @@ export function createForkContextResolver(
 		path.basename(parentSessionFile, ".jsonl"),
 		"forks",
 	);
-	const cachedSessionFiles = new Map<number, string>();
+	const cachedResolutions = new Map<number, ForkContextResolution>();
 	const preparedIndexes = new Set<number>();
 	const preparationPromises = new Map<number, Promise<void>>();
 
-	const resolveFork = (index = 0): string => {
-		const cached = cachedSessionFiles.get(index);
+	const resolveFork = (index = 0): ForkContextResolution => {
+		const cached = cachedResolutions.get(index);
 		if (cached) return cached;
 		try {
 			if (!fs.existsSync(parentSessionFile)) {
@@ -190,23 +247,37 @@ export function createForkContextResolver(
 			if (!sessionFile) {
 				throw new Error("Session manager did not return a forked session file.");
 			}
+			const forceThinkingOff = (sanitized: boolean): boolean =>
+				sanitized && (options.forceThinkingOffForIndex?.(index) ?? false);
+			let thinkingOverride: "off" | undefined;
+			let transcriptSanitized = false;
 			if (!fs.existsSync(sessionFile)) {
 				const header = sourceManager.getHeader?.();
 				const entries = sourceManager.getEntries?.();
 				if (!header || !entries) {
 					throw new Error(`Session manager returned a forked session file that does not exist and cannot be persisted by fallback: ${sessionFile}`);
 				}
-				sanitizeUnsafeThinkingBlocks(entries);
+				transcriptSanitized = sanitizeUnsafeThinkingBlocks(entries);
+				if (forceThinkingOff(transcriptSanitized)) {
+					appendThinkingOffEntry(entries);
+					thinkingOverride = "off";
+				}
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				fs.writeFileSync(sessionFile, `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 			} else {
 				const entries = readSessionEntries(sessionFile);
-				if (sanitizeUnsafeThinkingBlocks(entries)) {
+				transcriptSanitized = sanitizeUnsafeThinkingBlocks(entries);
+				if (transcriptSanitized) {
+					if (forceThinkingOff(true)) {
+						appendThinkingOffEntry(entries);
+						thinkingOverride = "off";
+					}
 					fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 				}
 			}
-			cachedSessionFiles.set(index, sessionFile);
-			return sessionFile;
+			const resolution = { sessionFile, sanitized: transcriptSanitized, ...(thinkingOverride ? { thinkingOverride } : {}) };
+			cachedResolutions.set(index, resolution);
+			return resolution;
 		} catch (error) {
 			const cause = error instanceof Error ? error : new Error(String(error));
 			throw new Error(`Failed to create forked subagent session: ${cause.message}`, { cause });
@@ -215,11 +286,11 @@ export function createForkContextResolver(
 
 	return {
 		async prepareSessionForIndex(index = 0): Promise<void> {
-			const sessionFile = resolveFork(index);
+			const resolution = resolveFork(index);
 			if (!options.pruneSession || preparedIndexes.has(index)) return;
 			let preparation = preparationPromises.get(index);
 			if (!preparation) {
-				preparation = options.pruneSession(sessionFile).then(() => {
+				preparation = options.pruneSession(resolution.sessionFile).then(() => {
 					preparedIndexes.add(index);
 				});
 				preparationPromises.set(index, preparation);
@@ -230,7 +301,13 @@ export function createForkContextResolver(
 			if (options.pruneSession && !preparedIndexes.has(index)) {
 				throw new Error(`Pruned fork session ${index} was used before pruning completed.`);
 			}
-			return resolveFork(index);
+			return resolveFork(index).sessionFile;
+		},
+		thinkingOverrideForIndex(index = 0): "off" | undefined {
+			return resolveFork(index).thinkingOverride;
+		},
+		sanitizedForIndex(index = 0): boolean {
+			return resolveFork(index).sanitized;
 		},
 	};
 }

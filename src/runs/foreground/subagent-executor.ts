@@ -54,7 +54,7 @@ import { encodeIndexSegment } from "../background/index-segment.ts";
 import { enqueueChainAppendRequest, readPendingChainAppendRequests, runnerStepOutputNames } from "../background/chain-append.ts";
 import { ChainOutputValidationError, validateChainOutputBindingsWithContext } from "../shared/chain-outputs.ts";
 import { normalizeGateAcceptance, resolveAcceptanceReportMode, validateAcceptanceInput, validateExecutionAcceptance } from "../shared/acceptance.ts";
-import { canPreferFork, createForkContextResolver, resolveSubagentLaunchContext } from "../../shared/fork-context.ts";
+import { canPreferFork, createForkContextResolver, forkedChildRequiresThinkingOff, resolveSubagentLaunchContext } from "../../shared/fork-context.ts";
 import { createPrunedForkSessionWriter } from "../../shared/pruned-fork.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
@@ -471,7 +471,10 @@ function inheritedRunFanoutBudget(deps: Pick<ExecutorDeps, "childRuntime">): Run
 
 type ForkSessionFileForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => string | undefined;
 type PrepareForkSessionForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => Promise<void>;
-type ThinkingOverrideForTask = () => AgentConfig["thinking"] | undefined;
+type ForkThinkingOverrideForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => AgentConfig["thinking"] | undefined;
+/** Whether this task's fork had signed Anthropic thinking blocks stripped, so only the
+ * Anthropic candidates need thinking pinned off while the rest keep reasoning. */
+type ForkSanitizedForTask = (agentName: string, idx?: number, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin) => boolean;
 
 interface ExecutionContextData {
 	params: SubagentParamsLike;
@@ -491,7 +494,8 @@ interface ExecutionContextData {
 	sessionDirForIndex: (idx?: number) => string;
 	sessionFileForIndex: (idx?: number) => string | undefined;
 	sessionFileForTask: ForkSessionFileForTask;
-	thinkingOverrideForTask: ThinkingOverrideForTask;
+	thinkingOverrideForTask: ForkThinkingOverrideForTask;
+	forkSanitizedForTask: ForkSanitizedForTask;
 	artifactConfig: ArtifactConfig;
 	artifactsDir: string;
 	backgroundRequestedWhileClarifying: boolean;
@@ -2939,7 +2943,7 @@ function resolveStaticLaunchSummary(input: {
 	availableModels: ModelInfo[];
 	currentProvider?: string;
 	modelScope?: ModelScopeConfig;
-	thinkingOverrideForTask: ThinkingOverrideForTask;
+	thinkingOverrideForTask: ForkThinkingOverrideForTask;
 }): StaticLaunchSummary {
 	const agentConfig = input.agents.find((agent) => agent.name === input.agent);
 	const externalRunner = agentConfig?.runner?.type === "external-cli" || agentConfig?.runner?.type === "external-job";
@@ -2954,7 +2958,7 @@ function resolveStaticLaunchSummary(input: {
 			agentConfig?.modelProvider ?? input.currentProvider,
 			modelScopes.length === 0 ? {} : { scope: modelScopes },
 		);
-	const thinkingOverride = externalRunner ? undefined : input.thinkingOverrideForTask();
+	const thinkingOverride = externalRunner ? undefined : input.thinkingOverrideForTask(input.agent, input.index, model);
 	const thinking = externalRunner ? undefined : resolveEffectiveThinking(model, thinkingOverride ?? agentConfig?.thinking);
 	return {
 		agent: input.agent,
@@ -2970,7 +2974,7 @@ function collectStaticLaunchSummaries(input: {
 	availableModels: ModelInfo[];
 	currentProvider?: string;
 	modelScope?: ModelScopeConfig;
-	thinkingOverrideForTask: ThinkingOverrideForTask;
+	thinkingOverrideForTask: ForkThinkingOverrideForTask;
 	dynamicFanoutMaxItems?: number;
 }): StaticLaunchSummary[] {
 	const summary = (agent: string, index: number, explicitModel?: string) => resolveStaticLaunchSummary({
@@ -3194,6 +3198,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		sessionRoot,
 		sessionFileForTask,
 		thinkingOverrideForTask,
+		forkSanitizedForTask,
 		artifactConfig,
 		artifactsDir,
 		effectiveAsync,
@@ -3303,7 +3308,8 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			fast: params.fast,
 			modelOverrideFromParent,
 			modelOrigin,
-			thinkingOverride: externalRunnerWithoutExplicitModel ? undefined : thinkingOverrideForTask(),
+			thinkingOverride: externalRunnerWithoutExplicitModel ? undefined : thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
+			forkSanitized: externalRunnerWithoutExplicitModel ? false : forkSanitizedForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
 			thinkingCeiling: a.maxThinking,
 			maxSubagentDepth,
 			waitToolEnabled: deps.waitToolEnabled,
@@ -3678,6 +3684,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		sessionDirForIndex,
 		sessionFileForTask,
 		thinkingOverrideForTask,
+		forkSanitizedForTask,
 		shareEnabled,
 		artifactConfig,
 		artifactsDir,
@@ -3838,7 +3845,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	let childSessionControls: ForegroundChildSessionControls | undefined;
 	const foregroundControl = deps.state.foregroundControls.get(runId);
 	if (foregroundControl) {
-		const thinking = resolveEffectiveThinking(modelOverride, thinkingOverrideForTask());
+		const thinking = resolveEffectiveThinking(modelOverride, thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin));
 		beginForegroundChild(foregroundControl, omitUndefinedProperties({
 			index: 0,
 			agent: params.agent!,
@@ -3931,7 +3938,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			fast: params.fast,
 			modelOverrideFromParent,
 			modelOrigin,
-			thinkingOverride: thinkingOverrideForTask(),
+			thinkingOverride: thinkingOverrideForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
+			forkSanitized: forkSanitizedForTask(params.agent!, 0, modelOverride, modelOverrideFromParent, modelOrigin),
 			thinkingCeiling: agentConfig.maxThinking,
 			extensionBindings: params.extensionBindings,
 			availableModels,
@@ -6765,20 +6773,72 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 
 		let forkSessionFileForIndex: (idx?: number) => string | undefined = () => undefined;
 		let prepareForkSessionForIndex: (idx?: number) => Promise<void> = async () => {};
-		// Forked children keep their requested thinking level. Signed Anthropic thinking
-		// blocks are stripped from the inherited transcript by the resolver (they are bound
-		// to the parent session), which is not a reason to disable the child's own reasoning.
+		let forkThinkingOverrideForIndex: (idx?: number) => AgentConfig["thinking"] | undefined = () => undefined;
+		let forkSanitizedForIndex: (idx?: number) => boolean = () => false;
+		let prepareForkThinking = (_agentName: string, _index: number, _modelOverride?: string, _modelOverrideFromParent?: boolean, _modelOrigin?: ModelOrigin): void => {};
+		const forkThinkingRequirements = new Map<number, boolean>();
+		const forkThinkingDowngrades = new Map<number, string>();
 		try {
+			const forkAvailableModels = contextPolicy.usesFork ? ctx.modelRegistry.getAvailable().map(toModelInfo) : [];
+			const parentModel = requestParentModel;
+			prepareForkThinking = (agentName, index, modelOverride, modelOverrideFromParent, storedOrigin) => {
+				const agentConfig = agents.find((agent) => agent.name === agentName);
+				if (agentConfig?.runner?.type === "external-cli" || agentConfig?.runner?.type === "external-job") {
+					forkThinkingRequirements.set(index, true);
+					return;
+				}
+				const effectiveStoredOrigin = storedOrigin === "configured" && modelOverride === undefined && agentConfig?.model === undefined
+					? undefined
+					: storedOrigin;
+				const origin = resolveModelOrigin({
+					fromParent: modelOverrideFromParent,
+					storedOrigin: effectiveStoredOrigin,
+					explicitModel: modelOverrideFromParent || effectiveStoredOrigin === "configured" ? undefined : modelOverride,
+					agentModel: agentConfig?.model,
+					parentModel,
+				});
+				const primaryModel = modelOverrideFromParent
+					? modelOverride
+					: resolveEffectiveSubagentModel(
+						effectiveStoredOrigin === "configured" ? undefined : modelOverride,
+						agentConfig?.model,
+						parentModel,
+						forkAvailableModels,
+						agentConfig?.modelProvider ?? parentModel?.provider,
+						{ source: origin === "explicit" ? "explicit" : "inherited" },
+					);
+				const candidates = buildModelCandidates(
+					primaryModel,
+					agentConfig?.fallbackModels,
+					forkAvailableModels,
+					agentConfig?.modelProvider ?? parentModel?.provider,
+					{
+						primaryModelFromParent: origin === "inherited",
+						origin,
+					},
+				);
+				// Force the chain-wide `off` only when no candidate could reason anyway.
+				// When at least one candidate can (a self-hosted or OpenAI primary with
+				// Anthropic fallbacks), keep the configured thinking level and pin `:off`
+				// onto just the Anthropic candidates instead, so forked delegation does
+				// not silently lose reasoning for every provider in the chain.
+				forkThinkingRequirements.set(
+					index,
+					candidates.length === 0
+						|| candidates.every((candidate) => forkedChildRequiresThinkingOff(candidate, forkAvailableModels, parentModel?.provider)),
+				);
+			};
 			const pruneSession = contextPolicy.usesFork && deps.config.forkContext?.mode === "pruned"
 				? await createPrunedForkSessionWriter(ctx, deps.config.forkContext, signal)
 				: undefined;
-			const forkContextResolver = createForkContextResolver(
-				ctx.sessionManager,
-				contextPolicy.usesFork ? "fork" : undefined,
-				pruneSession ? { pruneSession } : {},
-			);
+			const forkContextResolver = createForkContextResolver(ctx.sessionManager, contextPolicy.usesFork ? "fork" : undefined, {
+				forceThinkingOffForIndex: (index) => forkThinkingRequirements.get(index) ?? true,
+				...(pruneSession ? { pruneSession } : {}),
+			});
 			prepareForkSessionForIndex = forkContextResolver.prepareSessionForIndex;
 			forkSessionFileForIndex = forkContextResolver.sessionFileForIndex;
+			forkThinkingOverrideForIndex = forkContextResolver.thinkingOverrideForIndex;
+			forkSanitizedForIndex = forkContextResolver.sanitizedForIndex;
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary);
 		}
@@ -6889,7 +6949,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (!shouldForkAgent(contextPolicy, agentName)) return;
 			await prepareForkSessionForIndex(idx);
 		};
-		const thinkingOverrideForTask: ThinkingOverrideForTask = () => delegatedThinkingOverride;
+		const forkThinkingOverrideForTask: ForkThinkingOverrideForTask = (agentName, idx = 0, modelOverride, modelOverrideFromParent, modelOrigin) => {
+			if (!shouldForkAgent(contextPolicy, agentName)) return delegatedThinkingOverride;
+			prepareForkThinking(agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin);
+			const override = forkThinkingOverrideForIndex(idx);
+			if (override === "off") forkThinkingDowngrades.set(idx, agentName);
+			return override ?? delegatedThinkingOverride;
+		};
+		const forkSanitizedForTask = (agentName: string, idx = 0, modelOverride?: string, modelOverrideFromParent?: boolean, modelOrigin?: ModelOrigin): boolean => {
+			if (!shouldForkAgent(contextPolicy, agentName)) return false;
+			prepareForkThinking(agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin);
+			return forkSanitizedForIndex(idx);
+		};
 		const childSessionFileForTask: ForkSessionFileForTask = (agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin) =>
 			forkSessionFileForTask(agentName, idx, modelOverride, modelOverrideFromParent, modelOrigin) ?? path.join(sessionDirForIndex(idx), "session.jsonl");
 		const childSessionFileForIndex = (idx?: number) =>
@@ -6978,7 +7049,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			sessionDirForIndex,
 			sessionFileForIndex: childSessionFileForIndex,
 			sessionFileForTask: childSessionFileForTask,
-			thinkingOverrideForTask,
+			thinkingOverrideForTask: forkThinkingOverrideForTask,
+			forkSanitizedForTask,
 			artifactConfig,
 			artifactsDir,
 			backgroundRequestedWhileClarifying,
@@ -7092,7 +7164,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
 					currentProvider: requestParentModel?.provider,
 					modelScope,
-					thinkingOverrideForTask,
+					thinkingOverrideForTask: forkThinkingOverrideForTask,
 					dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
 				});
 			} catch (error) {

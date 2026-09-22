@@ -422,6 +422,27 @@ function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 }
 
+function usageAfterAttempts(total: Usage, attempts: readonly ModelAttempt[]): Usage {
+	const used = emptyUsage();
+	for (const attempt of attempts) {
+		if (!attempt.usage) continue;
+		used.input += attempt.usage.input;
+		used.output += attempt.usage.output;
+		used.cacheRead += attempt.usage.cacheRead;
+		used.cacheWrite += attempt.usage.cacheWrite;
+		used.cost += attempt.usage.cost;
+		used.turns += attempt.usage.turns;
+	}
+	return {
+		input: total.input - used.input,
+		output: total.output - used.output,
+		cacheRead: total.cacheRead - used.cacheRead,
+		cacheWrite: total.cacheWrite - used.cacheWrite,
+		cost: total.cost - used.cost,
+		turns: total.turns - used.turns,
+	};
+}
+
 function tokenUsageFromAttempts(attempts: ModelAttempt[] | undefined): TokenUsage | null {
 	if (!attempts || attempts.length === 0) return null;
 	let input = 0;
@@ -1212,9 +1233,11 @@ export async function runSingleStepInner(
 			toolTimeoutMs: ctx.toolTimeoutMs,
 			runDeadlineAt: ctx.deadlineAt,
 			expectedModelForVerification,
+			accountFallbackCandidates: candidates.slice(modelIndex + 1).filter((fallback): fallback is string => Boolean(fallback)),
 			modelVerificationRegistry: step.modelVerificationRegistry,
 			modelResponseAliases: step.modelResponseAliases,
 			mutationTools: step.mutationTools,
+			usageBudgetExhausted: ctx.usageBudgetExhausted,
 		}));
 		// A parked run still owes completion evidence when it actually finishes.
 		// Stopped/timedOut runs already have terminal failures; checking completion evidence there is meaningless.
@@ -1340,15 +1363,28 @@ export async function runSingleStepInner(
 					: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
 				: undefined);
 		const error = underlyingError ?? missingRequiredOutputError ?? completionEvidence.legacyFailureError;
+		const accountFallback = run.sameSessionAccountFallback;
+		delete run.sameSessionAccountFallback;
+		const selectedCandidate = accountFallback?.attemptedCandidates.at(-1) ?? candidate;
+		for (let index = 0; index < (accountFallback?.failedAttempts.length ?? 0); index++) {
+			const failedAttempt = accountFallback!.failedAttempts[index]!;
+			modelAttempts.push(failedAttempt);
+			recordRetryableModelFailure(failedAttempt.model, failedAttempt.error);
+			attemptNotes.push(formatModelAttemptNote(failedAttempt, accountFallback!.attemptedCandidates[index + 1]));
+		}
 		const attempt: ModelAttempt = omitUndefinedProperties({
-			model: candidate ?? run.model ?? step.model ?? "default",
+			model: selectedCandidate ?? run.model ?? step.model ?? "default",
 			success: effectiveExitCode === 0 && !error,
 			exitCode: effectiveExitCode,
 			error,
-			usage: run.usage,
+			usage: usageAfterAttempts(run.usage, accountFallback?.failedAttempts ?? []),
 		});
 		modelAttempts.push(attempt);
-		if (!recoveringAbort && candidate) attemptedModels.push(candidate);
+		if (!recoveringAbort) {
+			if (accountFallback) attemptedModels.push(...accountFallback.attemptedCandidates);
+			else if (candidate) attemptedModels.push(candidate);
+		}
+		modelIndex += accountFallback?.failedAttempts.length ?? 0;
 		completionGuardTriggeredFinal = completionEvidence.guardTriggered && !underlyingError && !missingRequiredOutputError;
 		finalOutputSnapshot = outputSnapshot;
 		if (step.toolBudget) {
@@ -1365,7 +1401,7 @@ export async function runSingleStepInner(
 			afterCompactionSettlement: run.afterCompactionSettlement === true,
 		});
 		const fileMutationEffect = completionEvidence.fileMutation ?? (missingRequiredOutputAfterMutation ? { status: "observed" as const, expected: completionEvidence.mutationExpected, attempted: true, evidence: mutationEvidence } : undefined);
-		finalResult = { ...run, exitCode: effectiveExitCode, model: candidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
+		finalResult = { ...run, exitCode: effectiveExitCode, model: selectedCandidate ?? run.model, error, structuredOutput, runtimeAcknowledgedExtensions, ...(step.agentContract ? { agentContract: step.agentContract } : {}), ...(fileMutationEffect || settlementDiagnostic ? { effects: { ...(fileMutationEffect ? { fileMutation: fileMutationEffect } : {}), ...(settlementDiagnostic ? { settlementDiagnostic } : {}) } } : {}) } as RunChildSessionResult;
 		const abortRecovery = !attempt.success ? planAbortRecovery({
 			messages: run.messages,
 			error,

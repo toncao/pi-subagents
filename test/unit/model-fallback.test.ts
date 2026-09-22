@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
 	buildModelCandidates,
+	canContinueSameSessionAfterRateLimit,
 	fuzzyResolveModel,
 	formatSubagentModelVerificationError,
 	isContextOverflow,
 	isRetryableModelFailure,
 	isRetryableModelFailureAttempt,
+	isSameModelAccountFallback,
 	normalizeModelSegment,
 	recordRetryableModelFailure,
 	resolveEffectiveSubagentModel,
@@ -545,6 +547,30 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [{ role: "assistant", errorMessage: "APIConnectionError: Connection closed." }], toolCount: 0 }), true);
 		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [], toolCount: 0 }), true);
 		assert.equal(isRetryableModelFailureAttempt({ error: "APIConnectionError: Connection closed.", messages: [{ role: "assistant", errorMessage: "APIConnectionError: Connection closed." }], toolCount: 1 }), false);
+	});
+
+	it("recognizes only exact same-model account aliases", () => {
+		assert.equal(isSameModelAccountFallback("anthropic/claude-sonnet-4:high", "anthropic-2/claude-sonnet-4:high"), true);
+		assert.equal(isSameModelAccountFallback("openai-codex/gpt-5.4", "openai-codex-account-3/gpt-5.4"), true);
+		assert.equal(isSameModelAccountFallback("anthropic/claude-sonnet-4", "openai/claude-sonnet-4"), false);
+		assert.equal(isSameModelAccountFallback("anthropic/claude-sonnet-4", "anthropic-2/claude-opus-4"), false);
+	});
+
+	it("allows same-session continuation only for a trusted terminal rate limit after complete tools", () => {
+		const error = "429 rate limit exceeded";
+		const complete = [
+			{ role: "assistant", content: [{ type: "toolCall", id: "write-1", name: "write" }], stopReason: "toolUse" },
+			{ role: "toolResult", toolCallId: "write-1", isError: false, content: [{ type: "text", text: "done" }] },
+			{ role: "assistant", content: [], stopReason: "error", errorMessage: error },
+		];
+		const base = { currentModel: "anthropic/claude-sonnet-4", nextModel: "anthropic-2/claude-sonnet-4", error, messages: complete, toolCount: 1 };
+		assert.equal(canContinueSameSessionAfterRateLimit(base), true);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, error: "tool output included 429", messages: complete }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: complete.slice(0, 1) }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, messages: [{ ...complete[0] }, { ...complete[1], isError: true }, complete[2]] }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, cancelled: true }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, budgetExhausted: true }), false);
+		assert.equal(canContinueSameSessionAfterRateLimit({ ...base, currentTool: "write" }), false);
 	});
 });
 

@@ -1,8 +1,10 @@
-import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { forkedChildRequiresThinkingOff } from "../../shared/fork-context.ts";
+import { splitKnownThinkingSuffix as splitThinkingSuffix, splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 import { redactSecretValues } from "./permissions.ts";
+import { getProviderLiveness } from "./provider-liveness.ts";
 
 export type { AvailableModelInfo };
 
@@ -15,6 +17,33 @@ interface ModelAttemptSummary {
 }
 
 export { splitThinkingSuffix };
+
+/** Pin `:off` onto only the candidates that cannot resume a sanitized fork with thinking.
+ *
+ * A sanitized fork had signed/redacted Anthropic thinking blocks stripped, which only
+ * Anthropic's message API rejects on replay. Forcing the whole candidate chain to `off`
+ * because one fallback is Anthropic silently disables reasoning for unrelated providers,
+ * so mark each candidate individually and leave the rest on their configured level.
+ * The suffix is authoritative at launch and across fallback switches, because
+ * `resolveEffectiveThinking` prefers a candidate's own suffix over the step thinking. */
+export function applyForkThinkingToModel(
+	model: string | undefined,
+	options: { sanitized: boolean; availableModels?: AvailableModelInfo[]; preferredProvider?: string },
+): string | undefined {
+	if (!model) return model;
+	return applyForkThinkingToCandidates([model], options)[0] ?? model;
+}
+
+export function applyForkThinkingToCandidates(
+	candidates: string[],
+	options: { sanitized: boolean; availableModels?: AvailableModelInfo[]; preferredProvider?: string },
+): string[] {
+	if (!options.sanitized) return candidates;
+	return candidates.map((candidate) => {
+		if (!forkedChildRequiresThinkingOff(candidate, options.availableModels, options.preferredProvider)) return candidate;
+		return `${splitKnownThinkingSuffix(candidate).baseModel}:off`;
+	});
+}
 
 /** Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID. */
 export function formatSubagentModelVerificationError(
@@ -328,14 +357,52 @@ function isCurrentRegistryModel(candidate: string, availableModels: AvailableMod
 	return availableModels.some((entry) => entry.fullId === baseModel);
 }
 
-function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+/**
+ * A record whose model was missing from the registry then, but is present now.
+ * Describes a registry we no longer have.
+ *
+ * Deliberately NOT applied to explicitly requested models: a pinned model that
+ * once failed to resolve is a configuration signal worth surfacing loudly
+ * rather than silently proceeding past.
+ */
+function isStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
 	const reason = exclusion.reason ?? "";
 	return MODEL_UNAVAILABLE_EXCLUSION_PATTERNS.some((pattern) => pattern.test(reason)) && isCurrentRegistryModel(candidate, availableModels);
 }
 
-function throwForExplicitModelExclusion(model: string): void {
+/**
+ * A limit-class record (429 / quota / usage limit) whose account is serving again.
+ *
+ * Such a record describes a shared *account*, not this model, and the provider
+ * refills that account on its own schedule. When `pi-multi-account` publishes a
+ * fresh verdict that the account is live, that reading outranks our stored copy
+ * of a past refusal: one 429 must not blockade a healthy account for the whole
+ * exclusion TTL. A provider-side limit is the provider's to enforce and to
+ * lift — not ours to cache past its lifetime.
+ *
+ * Any provider whose liveness is `"unknown"` (no companion installed, stale
+ * snapshot, unparseable state) keeps its exclusion, so absent evidence the
+ * conservative path is unchanged.
+ */
+function isRecoveredLimitExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>): boolean {
+	const reason = exclusion.reason ?? "";
+	if (!RUNTIME_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(reason))) return false;
+	const { provider } = parseModelKey(candidate);
+	return getProviderLiveness(provider ?? exclusion.provider, Date.now(), exclusion.recordedAt) === "live";
+}
+
+function ignoreStaleExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
+	return isStaleModelUnavailableExclusion(candidate, exclusion, availableModels) || isRecoveredLimitExclusion(candidate, exclusion);
+}
+
+function throwForExplicitModelExclusion(model: string, _availableModels: AvailableModelInfo[] | undefined): void {
 	const exclusion = findModelExclusion(model);
 	if (!exclusion) return;
+	// An explicitly pinned model has no fallback chain to fall through to, so a
+	// stale limit record here is strictly more damaging than on a fallback
+	// candidate: it fails the launch outright. It clears on live provider
+	// evidence. Model-unavailable records stay strict (see above).
+	if (isRecoveredLimitExclusion(model, exclusion)) return;
 	const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
 	const expiry = Number.isFinite(exclusion.expiresAt) ? `; expires: ${new Date(exclusion.expiresAt).toISOString()}` : "";
 	throw new Error(`Requested subagent model '${model}' is excluded and cannot be replaced by a fallback (reason: ${reason}${expiry}).`);
@@ -377,7 +444,7 @@ export function resolveSubagentModelOverride(
 		const candidate = resolveSubagentModelCandidate(explicit, availableModels, preferredProvider);
 		if (options?.source === "explicit") {
 			resolved = candidate ?? resolveRequiredSubagentModelCandidate(explicit, availableModels, preferredProvider);
-			throwForExplicitModelExclusion(resolved);
+			throwForExplicitModelExclusion(resolved, availableModels);
 			resolvedFromRegistry = true;
 		} else if (candidate) {
 			resolved = candidate;
@@ -480,7 +547,7 @@ export function buildModelCandidates(
 	};
 	if (origin === "explicit" && primaryModel) {
 		const normalized = resolveRequiredSubagentModelCandidate(primaryModel.trim(), availableModels, preferredProvider);
-		throwForExplicitModelExclusion(normalized);
+		throwForExplicitModelExclusion(normalized, availableModels);
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		primaryModel = normalized;
 	}
@@ -513,7 +580,7 @@ export function buildModelCandidates(
 	}
 	const resolved = filterFallbackCandidates(candidates, {
 		onExcluded: warnCachedExclusion,
-		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
+		ignoreExclusion: (candidate, exclusion) => ignoreStaleExclusion(candidate, exclusion, availableModels),
 	});
 	if (resolved.length === 0) {
 		if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
@@ -612,6 +679,86 @@ export function isRetryableModelFailureAttempt(input: { error: string | undefine
 // Request-shape failures can match broad fallback signals such as "upstream",
 // but do not establish that the model is unhealthy for subsequent requests.
 const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
+
+/** A deliberately small user message: the existing transcript carries the task and completed tool results. */
+export const SAME_SESSION_ACCOUNT_FALLBACK_NOTICE =
+	"The previous account reached a runtime rate or quota limit. Continue the same task from the existing conversation and completed tool results. Do not repeat completed tool calls or redo completed work.";
+
+const RUNTIME_RATE_LIMIT_PATTERNS = [
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/\b429\b/,
+	/quota/i,
+];
+
+function accountProviderFamily(provider: string | undefined): string | undefined {
+	if (!provider) return undefined;
+	if (/^anthropic(?:-\d+|-account-\d+)?$/i.test(provider)) return "anthropic";
+	if (/^openai-codex(?:-\d+|-account-\d+)?$/i.test(provider)) return "openai-codex";
+	const legacy = /^(.*)-account-\d+$/i.exec(provider);
+	return legacy?.[1]?.toLowerCase() ?? provider.toLowerCase();
+}
+
+/** Only account aliases for the exact same model are eligible for post-tool continuation. */
+export function isSameModelAccountFallback(currentModel: string | undefined, nextModel: string | undefined): boolean {
+	if (!currentModel || !nextModel) return false;
+	const current = parseModelKey(currentModel);
+	const next = parseModelKey(nextModel);
+	if (!current.provider || !next.provider || current.modelId !== next.modelId) return false;
+	const currentFamily = accountProviderFamily(current.provider);
+	return currentFamily === accountProviderFamily(next.provider) && current.provider.toLowerCase() !== next.provider.toLowerCase();
+}
+
+function completedToolHistory(messages: readonly unknown[]): { completed: number; safe: boolean } {
+	const pending = new Set<string>();
+	let completed = 0;
+	for (const raw of messages) {
+		if (!raw || typeof raw !== "object") continue;
+		const message = raw as { role?: unknown; content?: unknown; toolCallId?: unknown; isError?: unknown };
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const part of message.content) {
+				if (!part || typeof part !== "object" || (part as { type?: unknown }).type !== "toolCall") continue;
+				const id = (part as { id?: unknown }).id;
+				if (typeof id !== "string" || !id) return { completed, safe: false };
+				pending.add(id);
+			}
+		}
+		if (message.role !== "toolResult") continue;
+		if (message.isError === true || typeof message.toolCallId !== "string" || !pending.delete(message.toolCallId)) {
+			return { completed, safe: false };
+		}
+		completed++;
+	}
+	return { completed, safe: pending.size === 0 };
+}
+
+/**
+ * Fail closed unless a trusted terminal assistant rate/quota error follows a
+ * fully paired, error-free tool history. Tool text merely mentioning 429 can
+ * never satisfy this predicate.
+ */
+export function canContinueSameSessionAfterRateLimit(input: {
+	currentModel?: string;
+	nextModel?: string;
+	error?: string;
+	messages?: readonly unknown[];
+	toolCount?: number;
+	currentTool?: string;
+	cancelled?: boolean;
+	budgetExhausted?: boolean;
+	structuredOutputInvoked?: boolean;
+}): boolean {
+	if (!isSameModelAccountFallback(input.currentModel, input.nextModel)) return false;
+	if (input.cancelled || input.budgetExhausted || input.structuredOutputInvoked || input.currentTool) return false;
+	if ((input.toolCount ?? 0) <= 0 || !input.error || !RUNTIME_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(input.error!))) return false;
+	const messages = input.messages ?? [];
+	const terminal = messages.at(-1) as { role?: unknown; stopReason?: unknown; errorMessage?: unknown } | undefined;
+	if (terminal?.role !== "assistant" || terminal.stopReason !== "error") return false;
+	if (typeof terminal.errorMessage !== "string" || terminal.errorMessage.trim() !== input.error.trim()) return false;
+	const history = completedToolHistory(messages);
+	return history.safe && history.completed > 0;
+}
 
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
 	if (!model || !error || !isRetryableModelFailure(error) || isContextOverflow(error)) return;

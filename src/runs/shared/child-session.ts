@@ -90,6 +90,8 @@ export interface ChildSession {
 	prompt(text: string): Promise<void>;
 	steer(text: string): Promise<void>;
 	followUp(text: string): Promise<void>;
+	/** Switch this live session to an already-resolved candidate without replacing its transcript or tools. */
+	switchModel(model: string): Promise<void>;
 	abort(): Promise<void>;
 	/** Emits `session_shutdown` to the child's extensions and disposes the session; resolves once that shutdown work is done. */
 	dispose(): Promise<void>;
@@ -295,6 +297,14 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			try { evidence = observeReadonly?.observe(pi, modelRuntime, session); }
 			catch (error) { session.dispose(); throw error; }
 			let pending: Promise<void> | undefined;
+			const switchModel = async (model: string): Promise<void> => {
+				const resolved = pi.resolveCliModel({ cliModel: model, modelRuntime });
+				if (resolved.error || !resolved.model) throw new Error(resolved.error ?? `Could not resolve fallback model '${model}'.`);
+				// The account switch belongs only to this child. Never rewrite the user's
+				// global model default while continuing the live session.
+				await (session.setModel as unknown as (next: typeof resolved.model, options: { persist: boolean }) => Promise<void>)(resolved.model, { persist: false });
+				if (resolved.thinkingLevel) session.setThinkingLevel(resolved.thinkingLevel);
+			};
 			// pi's own hosts emit `session_shutdown` before disposing a session so the
 			// extensions loaded into it (ambient extensions included) release their
 			// watchers, servers, and timers. Do the same, then dispose.
@@ -323,6 +333,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				},
 				steer: (text) => { evidence?.invalidate(); return session.steer(text); },
 				followUp: (text) => { evidence?.invalidate(); return session.followUp(text); },
+				switchModel,
 				abort: () => { evidence?.invalidate(); return session.abort(); },
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {

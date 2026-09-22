@@ -12,7 +12,11 @@ import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
 import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../../src/runs/shared/model-fallback.ts";
+import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
@@ -43,6 +47,7 @@ describe("in-process foreground child", () => {
 	beforeEach(() => {
 		tempDir = createTempDir();
 		mockPi.reset();
+		clearExclusions();
 		process.env.PI_SUBAGENT_CHILD_AGENT = savedEnv.PI_SUBAGENT_CHILD_AGENT ?? "";
 		delete process.env.PI_SUBAGENT_CHILD_AGENT;
 	});
@@ -180,6 +185,136 @@ describe("in-process foreground child", () => {
 		assert.equal(result.finalOutput, "finished");
 		assert.equal(mockPi.sessions[0]?.settled, true);
 		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("continues one live foreground session across same-model account rate limits", async () => {
+		const target = path.join(tempDir, "mutated-once.txt");
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+		const rateLimitedTurn = (model: string, id: string, error: string, mutate = false) => ({
+			...(mutate ? { writeFiles: [{ path: target, content: "once" }] } : {}),
+			jsonl: [
+				...(mutate ? [
+					{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id, name: "write", arguments: { path: target, content: "once" } }], model, stopReason: "toolUse", usage } },
+					{ type: "tool_execution_start", toolCallId: id, toolName: "write", args: { path: target, content: "once" } },
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: id, toolName: "write", isError: false, content: [{ type: "text", text: "wrote once" }] } },
+					{ type: "tool_execution_end", toolCallId: id, toolName: "write" },
+				] : []),
+				{ type: "message_end", message: { role: "assistant", content: [], model, stopReason: "error", errorMessage: error, usage } },
+			],
+		});
+		mockPi.onCall(rateLimitedTurn("anthropic/claude-sonnet-4", "write-1", "429 rate limit on account one", true));
+		mockPi.onCall(rateLimitedTurn("anthropic-2/claude-sonnet-4", "unused", "usage limit reached on account two"));
+		mockPi.onCall({ output: "continued with the prior write result" });
+
+		const result = await runSync(
+			tempDir,
+			[makeAgent("worker", { model: "anthropic/claude-sonnet-4", fallbackModels: ["anthropic-2/claude-sonnet-4", "anthropic-3/claude-sonnet-4"], completionGuard: false })],
+			"worker",
+			"Write the target once, then report success",
+			{
+				runId: "same-session-account-fallback",
+				availableModels: [
+					{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+					{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+					{ provider: "anthropic-3", id: "claude-sonnet-4", fullId: "anthropic-3/claude-sonnet-4" },
+				],
+			},
+		);
+
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(fs.readFileSync(target, "utf-8"), "once");
+		assert.equal(mockPi.sessions.length, 1, "fallback must retain the same SDK session");
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, ["anthropic-2/claude-sonnet-4", "anthropic-3/claude-sonnet-4"]);
+		assert.equal(mockPi.sessions[0]?.tasks[0]?.startsWith("Task: Write the target once, then report success"), true);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE, SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(mockPi.sessions[0]?.session?.messages.some((message) => message.role === "toolResult" && (message as { toolCallId?: string }).toolCallId === "write-1"), true);
+		assert.equal(result.progressSummary?.toolCount, 1, "same-session counters remain cumulative without replay");
+		assert.deepEqual(result.attemptedModels, ["anthropic/claude-sonnet-4", "anthropic-2/claude-sonnet-4", "anthropic-3/claude-sonnet-4"]);
+		assert.deepEqual(result.modelAttempts?.map((attempt) => ({ model: attempt.model, success: attempt.success })), [
+			{ model: "anthropic/claude-sonnet-4", success: false },
+			{ model: "anthropic-2/claude-sonnet-4", success: false },
+			{ model: "anthropic-3/claude-sonnet-4", success: true },
+		]);
+		assert.equal(result.usage.turns, 4);
+	});
+
+	it("uses ceiling-validated effective thinking for every foreground account switch", async () => {
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-thinking-1", name: "read", arguments: { path: "state.txt" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-thinking-1", toolName: "read", args: { path: "state.txt" } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "read-thinking-1", toolName: "read", isError: false, content: [{ type: "text", text: "state" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-thinking-1", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+		] });
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic-2/claude-sonnet-4", stopReason: "error", errorMessage: "quota exhausted", usage } },
+		] });
+		mockPi.onCall({ output: "continued at requested thinking" });
+
+		const result = await runSync(
+			tempDir,
+			[makeAgent("worker", { model: "anthropic/claude-sonnet-4", fallbackModels: ["anthropic-2/claude-sonnet-4:high", "anthropic-3/claude-sonnet-4"], completionGuard: false })],
+			"worker",
+			"Inspect state once",
+			{
+				runId: "same-session-effective-thinking",
+				thinkingOverride: "low",
+				thinkingCeiling: "low",
+				availableModels: [
+					{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+					{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+					{ provider: "anthropic-3", id: "claude-sonnet-4", fullId: "anthropic-3/claude-sonnet-4" },
+				],
+			},
+		);
+
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.equal(mockPi.sessions[0]?.launch.model, "anthropic/claude-sonnet-4:low");
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, ["anthropic-2/claude-sonnet-4:low", "anthropic-3/claude-sonnet-4:low"]);
+	});
+
+	it("uses the same continuation seam in the background child driver", async () => {
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "state.txt" } }], model: "openai-codex/gpt-5.4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "state.txt" } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false, content: [{ type: "text", text: "prior result" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-1", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "openai-codex/gpt-5.4", stopReason: "error", errorMessage: "quota exhausted", usage } },
+		] });
+		mockPi.onCall({ output: "continued asynchronously" });
+		const launch = buildInProcessChildLaunch({
+			sessionEnabled: false,
+			model: "openai-codex/gpt-5.4",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			cwd: tempDir,
+			childAgentName: "worker",
+			childIndex: 0,
+			host: "runner",
+		});
+		const result = await runChildSession({
+			factory: childSessionFactory(),
+			launch,
+			prompt: "Task: inspect state once",
+			appendChildEvent: () => {},
+			writeOutputLine: () => {},
+			expectedModelForVerification: "openai-codex/gpt-5.4",
+			accountFallbackCandidates: ["openai-codex-2/gpt-5.4"],
+			modelVerificationRegistry: [
+				{ provider: "openai-codex", id: "gpt-5.4", fullId: "openai-codex/gpt-5.4" },
+				{ provider: "openai-codex-2", id: "gpt-5.4", fullId: "openai-codex-2/gpt-5.4" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.toolCount, 1);
+		assert.deepEqual(result.sameSessionAccountFallback?.attemptedCandidates, ["openai-codex/gpt-5.4", "openai-codex-2/gpt-5.4"]);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(result.messages.some((message) => message.role === "toolResult" && (message as { toolCallId?: string }).toolCallId === "read-1"), true);
 	});
 
 	it("reports the run only after the child session's shutdown work finished", async () => {
@@ -431,6 +566,23 @@ describe("default child session factory", () => {
 
 		assert.equal(child.modelId, "router/mimo-v2.5");
 		assert.deepEqual(pendingRuntime?.pendingProviderRegistrations, []);
+	});
+
+	it("switches the live SDK session model without persisting a global default", async () => {
+		const switched: Array<{ model: unknown; options: unknown }> = [];
+		const thinking: string[] = [];
+		const pi = stubPi({
+			setModel: async (model: unknown, options: unknown) => { switched.push({ model, options }); },
+			setThinkingLevel: (level: string) => { thinking.push(level); },
+		});
+		pi.resolveCliModel = (({ cliModel }) => cliModel === "anthropic-2/claude-sonnet-4:high"
+			? { model: { provider: "anthropic-2", id: "claude-sonnet-4" }, thinkingLevel: "high" }
+			: {}) as PiCodingAgentModule["resolveCliModel"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		const child = await factory.create(stubLaunch);
+		await child.switchModel("anthropic-2/claude-sonnet-4:high");
+		assert.deepEqual(switched, [{ model: { provider: "anthropic-2", id: "claude-sonnet-4" }, options: { persist: false } }]);
+		assert.deepEqual(thinking, ["high"]);
 	});
 
 	it("reports a missing extension cache reset when the child loads extension files", async () => {

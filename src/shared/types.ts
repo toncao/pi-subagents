@@ -2430,6 +2430,9 @@ export interface RunSyncOptions {
 	llmIntentArbiter?: import("../runs/shared/llm-intent-arbiter.ts").TaskMutationArbiter;
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
+	/** The forked transcript had signed Anthropic thinking blocks stripped. Anthropic
+	 * candidates then launch with thinking off, while other providers keep reasoning. */
+	forkSanitized?: boolean;
 	thinkingCeiling?: ThinkingLevel;
 	extensionBindings?: ExtensionBindings;
 	/** Package-internal one-use authorization for one foreground workflow child. */

@@ -22,6 +22,7 @@ import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
+import { SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../../src/runs/shared/model-fallback.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
 import {
 	installAsyncExecutionHooks, mockAssistantMessage, available, isAsyncAvailable,
@@ -489,6 +490,58 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.model, "anthropic/claude-sonnet-4");
 		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("continues an inherited-model background session when primary verification is skipped", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const target = path.join(tempDir, `async-same-session-${Date.now().toString(36)}.txt`);
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+		mockPi.onCall({
+			writeFiles: [{ path: target, content: "once" }],
+			jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "write-async-1", name: "write", arguments: { path: target, content: "once" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+				{ type: "tool_execution_start", toolCallId: "write-async-1", toolName: "write", args: { path: target, content: "once" } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "write-async-1", toolName: "write", isError: false, content: [{ type: "text", text: "wrote once" }] } },
+				{ type: "tool_execution_end", toolCallId: "write-async-1", toolName: "write" },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit exceeded", usage } },
+			],
+		});
+		mockPi.onCall({ output: "continued from the retained tool result" });
+		const id = `async-same-session-account-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Write once, then finish",
+			agentConfig: makeAgent("worker", { fallbackModels: ["anthropic-2/claude-sonnet-4:high"], maxThinking: "low", completionGuard: false }),
+			thinkingOverride: "low",
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+			],
+			ctx: {
+				pi: { events: { emit() {} } },
+				cwd: tempDir,
+				currentSessionId: "session-1",
+				currentModelProvider: "anthropic",
+				currentModel: { provider: "anthropic", id: "claude-sonnet-4" },
+			},
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(fs.readFileSync(target, "utf-8"), "once");
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["anthropic/claude-sonnet-4:low", "anthropic-2/claude-sonnet-4:low"]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map((attempt) => attempt.success), [false, true]);
+		const calls = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { sessionId?: string; args?: string[] });
+		assert.equal(calls.length, 2);
+		assert.equal(new Set(calls.map((call) => call.sessionId)).size, 1, "both prompts must use one live child session");
+		assert.deepEqual(calls.map((call) => {
+			const modelFlag = call.args?.indexOf("--model") ?? -1;
+			return modelFlag >= 0 ? call.args?.[modelFlag + 1] : undefined;
+		}), ["anthropic/claude-sonnet-4:low", "anthropic-2/claude-sonnet-4:low"], "the override must replace a raw :high fallback before the live switch");
+		assert.equal(calls.some((call) => call.args?.at(-1) === SAME_SESSION_ACCOUNT_FALLBACK_NOTICE), true);
 	});
 
 	it("rejects an explicit cached-excluded model before spawn even when a fallback exists", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
