@@ -26,7 +26,7 @@ import {
 	WIDGET_KEY,
 } from "../shared/types.ts";
 import { previewDisplayText, sanitizeDisplayText, truncateDisplayText } from "../shared/display-text.ts";
-import { FLEET_OPEN_SHORTCUT, formatShortcutLabel } from "../shared/shortcuts.ts";
+import { formatShortcutLabel } from "../shared/shortcuts.ts";
 import { formatContextUsage, formatTokens, formatUsage, formatDuration, formatModelThinking, formatToolCall, formatTokenUsage, shortenPath } from "../shared/formatters.ts";
 import { getDisplayItems, getSingleResultOutput, PROMPT_REDACTED } from "../shared/utils.ts";
 import { flatToLogicalStepIndex } from "../runs/background/parallel-groups.ts";
@@ -83,23 +83,24 @@ function capCompactMainWindowResult(component: Component, layout: MainWindowRend
 		if (lines.length <= maxLines) return lines;
 		const visibleRows = maxLines === 1 ? 1 : maxLines - 1;
 		const hiddenCount = lines.length - visibleRows;
-		const hint = theme.fg("accent", `… ${hiddenCount} rows hidden · ${liveDetailKeyText()} expands`);
+		const hint = theme.fg("accent", `… ${hiddenCount} rows hidden · ${expandKeyHint("to expand", "to view them")}`);
 		if (maxLines === 1) return [truncLine(`${lines[0] ?? ""} ${hint}`, width)];
 		return [...lines.slice(0, visibleRows), truncLine(hint, width)];
 	};
 	return capped;
 }
 
-function liveDetailKeyText(): string {
-	return keyText("app.tools.expand");
+function expandKeyHint(action: string, unconfiguredAction = action): string {
+	const shortcut = keyText("app.tools.expand");
+	return shortcut ? `Press ${shortcut} ${action}` : `Configure the expand key ${unconfiguredAction}`;
 }
 
 export function liveDetailHintText(): string {
-	return `Press ${liveDetailKeyText()} for live detail · ${formatShortcutLabel(FLEET_OPEN_SHORTCUT)} Fleet`;
+	return expandKeyHint("for live detail");
 }
 
 function workflowDetailHintText(): string {
-	return `Press ${liveDetailKeyText()} for details · ${formatShortcutLabel(FLEET_OPEN_SHORTCUT)} Fleet`;
+	return expandKeyHint("for details");
 }
 
 function foregroundSingleHintText(shortcut?: string): string {
@@ -2111,8 +2112,12 @@ function widgetStats(job: AsyncJobState, theme: Theme, projection = buildWorkflo
 	return statJoin(theme, parts);
 }
 
-function widgetStepStats(theme: Theme, step: NonNullable<AsyncJobState["steps"]>[number]): string {
+function widgetStepStats(theme: Theme, step: NonNullable<AsyncJobState["steps"]>[number], snapshotNow = Date.now()): string {
+	const externalElapsed = step.runner?.type === "external-cli" && step.externalProcess
+		? step.externalProcess.durationMs ?? Math.max(0, (step.externalProcess.endedAt ?? snapshotNow) - step.externalProcess.startedAt)
+		: undefined;
 	return statJoin(theme, [
+		step.runner?.type === "external-cli" ? "external-cli" : "",
 		step.turnCount !== undefined ? `${step.turnCount} turns` : "",
 		step.toolCount !== undefined ? formatToolUseStat(step.toolCount) : "",
 		step.tokens
@@ -2120,7 +2125,7 @@ function widgetStepStats(theme: Theme, step: NonNullable<AsyncJobState["steps"]>
 				? formatContextUsage(step.tokens, step.contextLimit) ?? formatTokenUsage(step.tokens, "token")
 				: step.tokens.total ? formatTokenUsage(step.tokens, "token") : ""
 			: "",
-		step.durationMs !== undefined ? formatDuration(step.durationMs) : "",
+		externalElapsed !== undefined ? formatDuration(externalElapsed) : step.durationMs !== undefined ? formatDuration(step.durationMs) : "",
 	]);
 }
 
@@ -2314,7 +2319,7 @@ function foregroundStyleWidgetStepLines(
 	const rowIndent = options?.rowIndent ?? "  ";
 	const detailIndent = options?.detailIndent ?? "    ";
 	const status = widgetStepStatus(step.status, theme);
-	const stats = widgetStepStats(theme, step);
+	const stats = widgetStepStats(theme, step, job.updatedAt);
 	const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
 	const collapseDetails = shouldCollapseSingleChildDetails(job, step);
 	const displayName = collapseDetails ? singleChildAgentName(job, step) : childDisplayName(step);
@@ -2470,7 +2475,7 @@ function compactSingleWidgetLines(job: AsyncJobState, theme: Theme, width: numbe
 		const step = row.step;
 		const status = widgetStepStatus(step.status, theme);
 		const activity = widgetStepActivityLine(step, width, false, job.updatedAt);
-		const stepStats = widgetStepStats(theme, step);
+		const stepStats = widgetStepStats(theme, step, job.updatedAt);
 		const activitySuffix = activity ? ` ${theme.fg("dim", "·")} ${theme.fg("dim", activity)}` : "";
 		const modelDisplay = modelThinkingBadge(theme, step.model, step.thinking);
 		const task = compactTaskText(step.description, step.label);
@@ -2545,6 +2550,10 @@ function buildSingleLineWidgetLines(jobs: AsyncJobState[], theme: Theme, width: 
 	if (counts.failed.length > 0) parts.push(`${counts.failed.length} failed`);
 	if (counts.stopped.length > 0) parts.push(`${counts.stopped.length} stopped`);
 	if (counts.paused.length > 0) parts.push(`${counts.paused.length} paused`);
+	for (const status of ["partial", "rejected"] as const) {
+		const count = jobs.filter((job) => job.status === status).length;
+		if (count > 0) parts.push(`${count} ${status}`);
+	}
 	if (!hasActive && counts.complete.length > 0) parts.push(`${counts.complete.length}/${jobs.length} done`);
 	return [truncLine(`${theme.fg(hasActive ? "accent" : "dim", glyph)} ${theme.fg(hasActive ? "accent" : "dim", "subagents")} (${parts.join(", ") || `${jobs.length} total`})`, width)];
 }
@@ -2699,7 +2708,7 @@ function fitWidgetLineBudget(lines: string[], theme: Theme, width: number, expan
 	const hiddenCount = lines.length - visibleLines;
 	const hint = expanded
 		? `… ${hiddenCount} live-detail lines hidden`
-		: `… ${hiddenCount} lines hidden · ${liveDetailKeyText()} expands`;
+		: `… ${hiddenCount} lines hidden · ${expandKeyHint("to expand", "to view them")}`;
 	return [...lines.slice(0, visibleLines), truncLine(theme.fg("dim", hint), width)];
 }
 
@@ -2749,13 +2758,38 @@ const asyncWidgetUpdates = new WeakMap<ExtensionContext["ui"], (jobs: AsyncJobSt
 const inlineWorkflowCoverage = new WeakMap<ExtensionContext["ui"], ReadonlyMap<string, string>>();
 const asyncWidgetInvalidations = new WeakMap<ExtensionContext["ui"], () => void>();
 
-/** Include child identity and freshness in the roster's existing snapshot. */
+function inlineWorkflowDescendantShape(children: AsyncJobState["nestedChildren"]): unknown {
+	return children?.map((child) => [child.id, child.agent, inlineWorkflowDescendantShape(child.children)]);
+}
+
+function inlineWorkflowRowShape(job: AsyncJobState): unknown[] {
+	return [
+		job.asyncId,
+		job.parentWorkflowRunId,
+		job.workflowKey,
+		job.mode,
+		job.currentStep,
+		job.activeParallelGroup,
+		job.status,
+		job.context,
+		job.agents,
+		job.steps?.map((step, index) => [
+			step.index ?? index,
+			step.workflowKey,
+			step.agent,
+			step.status,
+			Boolean(step.runner),
+			inlineWorkflowDescendantShape(step.children),
+		]),
+		inlineWorkflowDescendantShape(job.nestedChildren),
+		job.hostSteps?.map((row) => [row.id, row.monitorKind, row.label]),
+		Boolean(job.workflowGraph),
+	];
+}
+
+/** Structural identity of the workflow rows that Fleet can cover. */
 export function inlineWorkflowRenderKey(job: AsyncJobState, children: AsyncJobState[]): string {
-	if (!children.length) return widgetRenderKey(job);
-	return JSON.stringify([widgetRenderKey(job), children.map((child) => [
-		child.asyncId, widgetRenderKey(child, true), child.context,
-		child.steps?.map((step) => [Boolean(step.runner), step.tokens?.window]), Boolean(child.workflowGraph),
-	])]);
+	return JSON.stringify([inlineWorkflowRowShape(job), children.map(inlineWorkflowRowShape)]);
 }
 
 /** Presentation-only coverage from the mounted inline Fleet roster, never configuration. */
@@ -2817,12 +2851,17 @@ function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"])
 		let cachedExpanded: boolean | undefined;
 		let cachedLines: string[] | undefined;
 		let cachedCoverage = "[]";
+		let collapsed = false;
 		const invalidate = (): void => {
 			cachedLines = undefined;
 			resetWidgetLayoutSession();
 			tui.requestRender();
 		};
-		asyncWidgetInvalidations.set(ui, invalidate);
+		const invalidateCoverage = (): void => {
+			cachedLines = undefined;
+			tui.requestRender();
+		};
+		asyncWidgetInvalidations.set(ui, invalidateCoverage);
 		const update = (nextJobs: AsyncJobState[]): void => {
 			jobs = nextJobs;
 			cachedLines = undefined;
@@ -2830,9 +2869,17 @@ function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"])
 		};
 		asyncWidgetUpdates.set(ui, update);
 		const component = Object.assign(container, {
+			// Only the mouse fields used here, without requiring newer Pi type exports.
+			handleMouse(event: { type: string; button: string; y: number; shift: boolean; alt: boolean; ctrl: boolean }) {
+				if (event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+				if (event.shift || event.alt || event.ctrl) return undefined;
+				collapsed = !collapsed;
+				invalidate();
+				return { handled: true };
+			},
 			dispose(): void {
 				if (asyncWidgetUpdates.get(ui) === update) asyncWidgetUpdates.delete(ui);
-				if (asyncWidgetInvalidations.get(ui) === invalidate) asyncWidgetInvalidations.delete(ui);
+				if (asyncWidgetInvalidations.get(ui) === invalidateCoverage) asyncWidgetInvalidations.delete(ui);
 			},
 		});
 		container.render = (renderWidth: number): string[] => {
@@ -2872,7 +2919,10 @@ function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"])
 			cachedRenderWidth = renderWidth;
 			cachedFrame = frame;
 			cachedExpanded = expanded;
-			cachedLines = fitAdaptiveWidgetLines(roots, buildLines, theme, width, expanded, frame, projectionFor).map((line) => paddedWidgetLine(line, renderWidth));
+			cachedLines = (collapsed
+				? buildSingleLineWidgetLines(jobs, theme, width, frame)
+				: fitAdaptiveWidgetLines(roots, buildLines, theme, width, expanded, frame, projectionFor)
+			).map((line) => paddedWidgetLine(line, renderWidth));
 			return cachedLines;
 		};
 		return component;
@@ -3371,7 +3421,7 @@ export function renderSubagentResult(
 			const c = new Container();
 			const detailIndent = mainWindowIndent(layout, 1);
 			c.addChild(new Text(truncLine(`${contextPrefix}${compactLine} · ${lines.length} lines`, width), 0, 0));
-			c.addChild(new Text(truncLine(theme.fg("accent", `${detailIndent}Press ${liveDetailKeyText()} for full output`), width), 0, 0));
+			c.addChild(new Text(truncLine(theme.fg("accent", `${detailIndent}${expandKeyHint("for full output")}`), width), 0, 0));
 			return compact(c);
 		}
 		const c = new Container();
@@ -3467,9 +3517,6 @@ export function renderSubagentResult(
 		}
 		if (r.skillsWarning) {
 			c.addChild(new Text(fit(theme.fg("warning", `Warning: ${r.skillsWarning}`)), 0, 0));
-		}
-		if (r.attemptedModels && r.attemptedModels.length > 1) {
-			c.addChild(new Text(fit(theme.fg("dim", `Fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
 		}
 		c.addChild(new Text(fit(theme.fg("dim", formatUsage(r.usage, r.model))), 0, 0));
 		if (r.sessionFile) {
@@ -3646,9 +3693,6 @@ export function renderSubagentResult(
 		}
 		if (r.skillsWarning) {
 			c.addChild(new Text(fit(theme.fg("warning", `    Warning: ${r.skillsWarning}`)), 0, 0));
-		}
-		if (r.attemptedModels && r.attemptedModels.length > 1) {
-			c.addChild(new Text(fit(theme.fg("dim", `    fallbacks: ${r.attemptedModels.join(" → ")}`)), 0, 0));
 		}
 
 		if (rRunning && rProg) {

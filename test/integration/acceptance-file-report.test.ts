@@ -41,6 +41,7 @@ interface ExecutionModule {
 		error?: string;
 		finalOutput?: string;
 		savedOutputPath?: string;
+		outputReference?: { path: string; message: string };
 		acceptance?: AcceptanceSummary;
 		artifactPaths?: AcceptanceArtifactPaths;
 	}>;
@@ -428,6 +429,38 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			assert.equal(result.savedOutputPath, outputPath);
 		});
 
+		it("retains the file-only report in the diagnostic artifact when acceptance rejects it", async () => {
+			const outputPath = path.join(tempDir, "rejected-report.md");
+			const artifactsDir = path.join(tempDir, "rejected-artifacts");
+			const fileReport = `# Findings\n${acceptanceReport("not-satisfied", "from child-written file")}`;
+			mockPi.onCall({
+				jsonl: [
+					...events.completedWrite(outputPath, fileReport),
+					events.assistantMessage(`Report written to the output file.\n${acceptanceReport("satisfied", "from assistant text")}`),
+				],
+				writeFiles: [{ path: outputPath, content: fileReport }],
+			});
+
+			const result = await runSync!(tempDir, makeAgentConfigs(["worker"]), "worker", "Write the findings report.", {
+				runId: "acceptance-file-only-rejected-artifact",
+				outputPath,
+				outputMode: "file-only",
+				acceptance: { level: "checked", criteria: ["Report the findings"] },
+				artifactsDir,
+				artifactConfig: ACCEPTANCE_ARTIFACTS,
+			});
+
+			assert.equal(result.acceptance?.status, "rejected");
+			assert.equal(result.exitCode, 1);
+			assert.equal(result.savedOutputPath, outputPath);
+			assert.equal(result.outputReference?.path, outputPath);
+			assert.equal(fs.readFileSync(outputPath, "utf-8"), fileReport);
+			assert.ok(result.artifactPaths);
+			const outputArtifact = fs.readFileSync(result.artifactPaths.outputPath, "utf-8");
+			assert.match(outputArtifact, /# Findings/);
+			assert.doesNotMatch(outputArtifact, /^Output saved to:/);
+		});
+
 		it("file-only mode persists acceptance metadata when final assistant text is only a receipt", async () => {
 			const outputPath = path.join(tempDir, "saved-review.md");
 			const artifactsDir = path.join(tempDir, "artifacts");
@@ -461,7 +494,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			const artifactsDir = path.join(tempDir, "report-only-artifacts");
 			mockPi.onCall({ output: acceptanceReport("satisfied", "report-only evidence") });
 
-			const result = await runSync!(tempDir, [makeAgent("worker", { completionGuard: false })], "worker", "Implement and report the fix.", {
+			const result = await runSync!(tempDir, [makeAgent("worker")], "worker", "Implement and report the fix.", {
 				runId: "acceptance-report-only",
 				acceptance: { level: "checked", criteria: ["Report the findings"] },
 				artifactsDir,
@@ -478,7 +511,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			assert.match(fs.readFileSync(result.artifactPaths.transcriptPath, "utf-8"), /```acceptance-report/);
 		});
 
-		it("inline mode persists final rejection metadata when the text report fails", async () => {
+		it("inline mode preserves resolved report content in the diagnostic artifact on rejection", async () => {
 			const outputPath = path.join(tempDir, "report.md");
 			const artifactsDir = path.join(tempDir, "rejected-artifacts");
 			conflictingReportsCall(outputPath, "satisfied", "not-satisfied");
@@ -503,8 +536,8 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			assert.equal(metadata.acceptance?.status, "rejected");
 			assert.equal(metadata.acceptance?.runtimeChecks?.find((check) => check.id === "criterion:criterion-1")?.status, "failed");
 			const outputArtifact = fs.readFileSync(result.artifactPaths.outputPath, "utf-8");
-			assert.match(outputArtifact, /Output saved to:/);
-			assert.match(outputArtifact, new RegExp(outputPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+			assert.match(outputArtifact, /# Findings/);
+			assert.doesNotMatch(outputArtifact, /^Output saved to:/);
 		});
 
 		it("inline mode keeps one saved output reference after rejection", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
@@ -519,7 +552,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 				tempArtifactsDir: artifactsDir,
 				getSubagentSessionRoot: () => tempDir,
 				expandTilde: (p: string) => p,
-				discoverAgents: () => ({ agents: [makeAgent("worker", { completionGuard: false })] }),
+				discoverAgents: () => ({ agents: [makeAgent("worker")] }),
 			});
 
 			const result = await executor.execute(
@@ -562,7 +595,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 				tempArtifactsDir: artifactsDir,
 				getSubagentSessionRoot: () => tempDir,
 				expandTilde: (p: string) => p,
-				discoverAgents: () => ({ agents: [makeAgent("worker", { completionGuard: false })] }),
+				discoverAgents: () => ({ agents: [makeAgent("worker")] }),
 			});
 
 			const result = await executor.execute(
@@ -719,7 +752,7 @@ export default function() {
 				diagnostic.launch(() => executeAsyncSingle!(id, {
 					agent: "worker",
 					task: "Write the findings report.",
-					agentConfig: makeAgent("worker", { completionGuard: false }),
+					agentConfig: makeAgent("worker"),
 					ctx: { pi: { events: { emit: diagnostic.emit } }, cwd: tempDir, currentSessionId: "session-file-report" },
 					artifactConfig,
 					artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),

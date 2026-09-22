@@ -1,10 +1,18 @@
 # Standalone background execution
 
-Supported standalone target: **official Pi 0.85.1, Linux x64**. Keep its adjacent release assets with the executable. Other versions, operating systems, architectures and packagers are not covered.
+Supported standalone target: **official Pi 0.86.1, Linux x64**. Keep its adjacent release assets with the executable. Other versions, operating systems, architectures and packagers are outside the fully validated support target; limited experimental Windows coverage is described below.
 
 Pi's extension loader supplies its embedded SDK to `binary-bootstrap.ts`, which awaits the existing configured runner before exiting. Startup authorization, revival leases, controls, disposal and process-close observation remain shared with npm. Each independent run has its own host; native sessions inside that run share it. No per-session CLI protocol, runtime download/install, alternate SDK or foreground fallback is introduced. Npm Pi keeps its Node runner, peer aliases and detected npm `PI_PACKAGE_DIR` override (including refusal when no npm root exists).
 
 Implementation and lifecycle fixtures derive from [@xz-dev](https://github.com/xz-dev)'s [PR #2049](https://github.com/nicobailon/pi-subagents/pull/2049), source commit `910807bfefcf9ee41d73fa25ec86dcd75ab8f4b2` (Xiangzhe, `xiangzhedev@gmail.com`). Integration retains the lifecycle contract and reduces commentary rather than removing its evidence gates.
+
+## Experimental Windows host recognition
+
+The resolver recognizes Bun's Windows virtual entrypoint prefixes, `B:/~BUN/` and `B:\~BUN\`, alongside `/$bunfs/`. It launches the real `process.execPath` (or the existing executable override). The `B:` prefix is virtual, not the installation drive; `pi-native.exe` is not a required executable name.
+
+Windows remains **experimental**: the full standalone lifecycle matrix has not been validated there or for every Bun-compiled Pi host.
+
+Node-hosted npm Pi keeps its existing runner path and is not affected by this virtual-entrypoint detection defect. Installing only the pi-subagents extension through npm does not change a Bun-compiled Pi host into an npm Pi host.
 
 ## Official binary gate
 
@@ -31,11 +39,11 @@ For a focused diagnostic, use `node test/smoke/standalone-background.mjs "$relea
 
 ## Npm regressions and local trial
 
-Existing npm clean-install CI covers real SDK 0.85.0 and 0.85.1. The standalone CI job also checks the public npm launch path without execution-time network:
+Existing npm clean-install CI covers real SDK 0.86.1. The standalone CI job also checks the public npm launch path without execution-time network:
 
 ```bash
 npm_checks="$(mktemp -d)"
-node test/smoke/pi085-clean-install.mjs "$npm_checks/sdk" 0.85.1
+node test/smoke/clean-install.mjs "$npm_checks/sdk" 0.86.1
 node test/smoke/npm-background.mjs "$npm_checks/sdk" "$npm_checks/launch"
 ```
 
@@ -45,5 +53,7 @@ To try a checkout without replacing your installation, start a separate supporte
 PI_CODING_AGENT_DIR="$(mktemp -d)" "$release_dir/pi/pi" \
   --no-extensions --no-skills --no-prompt-templates --extension "$PWD/index.ts"
 ```
+
+This command targets a source checkout. The published npm package uses the compiled `index.js` entry instead.
 
 Configure a provider in that isolated session, ask for a read-only background child and inspect its notification/run artifacts. This loads only the checkout for that process; it does not install the candidate or reuse normal credentials. Keep the parent alive for notifications.

@@ -232,10 +232,12 @@ function sanitizeLaunchResolvedExtensions(value: unknown): LaunchResolvedChildEx
 		disableAmbientExtensions: raw.disableAmbientExtensions,
 		runtime: stringList(raw.runtime),
 		configured: stringList(raw.configured),
+		required: Array.isArray(raw.required) ? raw.required.filter((item): item is string => typeof item === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(item)).slice(0, 32) : [],
 		effective: stringList(raw.effective),
 		omitted: {
 			runtime: omittedCount("runtime"),
 			configured: omittedCount("configured"),
+			required: omittedCount("required"),
 			effective: omittedCount("effective"),
 		},
 	};
@@ -609,6 +611,18 @@ export interface NestedRunMatch {
 	rootRunId: string;
 	route: NestedRoute;
 	run: NestedRunSummary;
+}
+
+export function retainNestedLookupRoute(
+	state: Pick<SubagentState, "currentSessionId" | "retainedNestedLookupRoutes">,
+	route: NestedRouteInfo | undefined,
+	sessionId: string | undefined,
+): void {
+	if (!route || !sessionId || sessionId !== state.currentSessionId) return;
+	if (state.retainedNestedLookupRoutes?.sessionId !== sessionId) {
+		state.retainedNestedLookupRoutes = { sessionId, routes: new Map() };
+	}
+	state.retainedNestedLookupRoutes.routes.set(route.rootRunId, route);
 }
 
 export interface NestedRunResolutionScope {
@@ -1063,8 +1077,15 @@ export function isTopLevelAsyncDir(asyncDir: string): boolean {
 	return containedPath(DIRS.async, resolved) && !containedPath(path.join(TEMP_ROOT_DIR, "nested-subagent-runs"), resolved);
 }
 
-export function nestedResultsPath(rootRunId: string, id: string): string {
+export function nestedRunScope(rootRunId: string) {
 	assertSafeId("rootRunId", rootRunId);
+	return {
+		asyncDirRoot: path.join(TEMP_ROOT_DIR, "nested-subagent-runs", rootRunId),
+		resultsDir: path.join(DIRS.results, "nested", rootRunId),
+	};
+}
+
+export function nestedResultsPath(rootRunId: string, id: string): string {
 	assertSafeId("id", id);
-	return path.join(DIRS.results, "nested", rootRunId, `${id}.json`);
+	return path.join(nestedRunScope(rootRunId).resultsDir, `${id}.json`);
 }

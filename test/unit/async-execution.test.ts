@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -29,6 +30,42 @@ const ctx = {
 };
 
 describe("async runner execution", () => {
+	it("propagates static parallel machine placement before agent pins and rejects group worktrees", { skip: process.platform === "win32" ? "Herdr saved-machine launches are unsupported on Windows" : undefined }, (t) => {
+		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-bin-"));
+		const herdr = path.join(bin, "herdr");
+		fs.writeFileSync(herdr, "#!/bin/sh\necho '[{\"id\":\"machine-1\",\"label\":\"workmac\",\"target\":\"host.example\",\"enabled\":true}]'\n", "utf-8");
+		fs.chmodSync(herdr, 0o755);
+		const previousHerdrBin = process.env.HERDR_BIN;
+		process.env.HERDR_BIN = herdr;
+		t.after(() => {
+			if (previousHerdrBin === undefined) delete process.env.HERDR_BIN;
+			else process.env.HERDR_BIN = previousHerdrBin;
+			fs.rmSync(bin, { recursive: true, force: true });
+		});
+		const external = { ...agent("external"), machine: "agent-pin", runner: { type: "external-cli" as const, adapter: "codex-exec" as const, command: "codex" } };
+		const built = buildAsyncRunnerSteps("parallel-machine", {
+			chain: [{ machine: "workmac", parallel: [{ agent: "external", task: "Review", cwd: "/remote/repo" }] }],
+			agents: [external],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-parallel-machine"),
+			maxSubagentDepth: 1,
+		});
+		assert.ok("steps" in built);
+		const parallel = built.steps[0];
+		assert.ok(parallel && "parallel" in parallel && Array.isArray(parallel.parallel));
+		assert.equal(parallel.parallel[0]?.machine?.label, "workmac");
+
+		const rejected = buildAsyncRunnerSteps("parallel-machine-worktree", {
+			chain: [{ machine: "workmac", worktree: true, parallel: [{ agent: "external", task: "Review" }] }],
+			agents: [external],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-parallel-machine-worktree"),
+			maxSubagentDepth: 1,
+		});
+		assert.ok("error" in rejected);
+		assert.match(rejected.error, /managed worktrees are local git operations/u);
+	});
+
 	it("uses supplied discovery context for missing async agents", () => {
 		const result = buildAsyncRunnerSteps("missing-agent", {
 			chain: [{ agent: "missing", task: "Do not launch" }],
@@ -202,9 +239,11 @@ describe("async runner execution", () => {
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 4, block: ["read"] });
 	});
 
-	it("attaches external runner config and rejects unsupported Pi-only overrides", () => {
+	it("attaches external runner config and rejects unsupported Pi-only overrides", (t) => {
 		const external = agent("external");
 		external.runner = { type: "external-cli", command: process.execPath, args: ["fake.mjs"] };
+		const registration = registerRequiredChildExtensions({ sessionId: ctx.currentSessionId, extensions: [{ id: "native-only", path: import.meta.filename }] });
+		t.after(registration.dispose);
 		const built = buildAsyncRunnerSteps("external-run", {
 			chain: [{ agent: "external", task: "review" }],
 			agents: [external],
@@ -215,6 +254,7 @@ describe("async runner execution", () => {
 		assert.ok("steps" in built);
 		assert.deepEqual(built.steps[0]?.runner, external.runner);
 		assert.equal(built.steps[0]?.model, undefined);
+		assert.equal(built.steps[0]?.requiredExtensions, undefined);
 
 		const rejected = buildAsyncRunnerSteps("external-rejected", {
 			chain: [{ agent: "external", task: "review", model: "provider/model" }],

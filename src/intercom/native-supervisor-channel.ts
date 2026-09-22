@@ -288,13 +288,18 @@ function parseRequestFile(file: string, channelDir: string): PendingSupervisorRe
 	}
 }
 
-function listRequestFiles(channelDirs?: string[]): Array<{ channelDir: string; file: string }> {
+function isMissingSupervisorDirectory(error: unknown, platform: NodeJS.Platform): boolean {
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "ENOENT" || (platform === "win32" && code === "UNKNOWN");
+}
+
+function listRequestFiles(channelDirs: string[] | undefined, platform: NodeJS.Platform): Array<{ channelDir: string; file: string }> {
 	if (!channelDirs) {
 		try {
 			channelDirs = fs.readdirSync(SUPERVISOR_CHANNEL_ROOT, { withFileTypes: true })
 				.filter(entry => entry.isDirectory()).map(entry => path.join(SUPERVISOR_CHANNEL_ROOT, entry.name));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			if (isMissingSupervisorDirectory(error, platform)) return [];
 			throw error;
 		}
 	}
@@ -314,11 +319,11 @@ function listRequestFiles(channelDirs?: string[]): Array<{ channelDir: string; f
 	return files;
 }
 
-function readDirectoryEntries(dir: string): fs.Dirent[] | undefined {
+function readDirectoryEntries(dir: string, platform: NodeJS.Platform): fs.Dirent[] | undefined {
 	try {
 		return fs.readdirSync(dir, { withFileTypes: true });
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if (isMissingSupervisorDirectory(error, platform)) return [];
 		return undefined;
 	}
 }
@@ -343,7 +348,7 @@ function removeEmptyDirectory(dir: string): boolean {
 	}
 }
 
-function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number): boolean {
+function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number, platform: NodeJS.Platform): boolean {
 	const requestsDir = path.join(channelDir, REQUESTS_DIR);
 	const repliesDir = path.join(channelDir, REPLIES_DIR);
 	const newestKnownMtimeMs = Math.max(
@@ -353,9 +358,9 @@ function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number): b
 	);
 	if (nowMs - newestKnownMtimeMs < STALE_EMPTY_CHANNEL_AGE_MS) return false;
 
-	const requestEntries = readDirectoryEntries(requestsDir);
+	const requestEntries = readDirectoryEntries(requestsDir, platform);
 	if (!requestEntries || requestEntries.length > 0) return false;
-	const replyEntries = readDirectoryEntries(repliesDir);
+	const replyEntries = readDirectoryEntries(repliesDir, platform);
 	if (!replyEntries || replyEntries.length > 0) return false;
 
 	if (!removeEmptyDirectory(requestsDir)) return false;
@@ -364,12 +369,12 @@ function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number): b
 	return true;
 }
 
-function cleanupStaleEmptySupervisorChannels(nowMs = Date.now()): number {
+function cleanupStaleEmptySupervisorChannels(nowMs = Date.now(), platform: NodeJS.Platform = process.platform): number {
 	let channelEntries: fs.Dirent[];
 	try {
 		channelEntries = fs.readdirSync(SUPERVISOR_CHANNEL_ROOT, { withFileTypes: true });
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+		if (isMissingSupervisorDirectory(error, platform)) return 0;
 		throw error;
 	}
 
@@ -377,7 +382,7 @@ function cleanupStaleEmptySupervisorChannels(nowMs = Date.now()): number {
 	for (const entry of channelEntries) {
 		if (!entry.isDirectory()) continue;
 		try {
-			if (removeStaleEmptySupervisorChannel(path.join(SUPERVISOR_CHANNEL_ROOT, entry.name), nowMs)) removed++;
+			if (removeStaleEmptySupervisorChannel(path.join(SUPERVISOR_CHANNEL_ROOT, entry.name), nowMs, platform)) removed++;
 		} catch {
 			// Cleanup is opportunistic; active writers can race with us and will be picked up by a later pass.
 		}
@@ -612,6 +617,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	start: () => void;
 	activateTransport: () => void;
 	findPendingAsks: (target: { runId: string; agent: string; childIndex: number }) => string[];
+	hasPendingRequests: () => boolean;
 	dispose: () => void;
 	pending: Map<string, PendingSupervisorRequest>;
 	getSupervisorRequestState: (event: ControlEvent) => SupervisorRequestState;
@@ -708,7 +714,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		if (nowMs - lastStaleCleanupAt < STALE_EMPTY_CHANNEL_CLEANUP_INTERVAL_MS) return;
 		lastStaleCleanupAt = nowMs;
 		try {
-			cleanupStaleEmptySupervisorChannels(nowMs);
+			cleanupStaleEmptySupervisorChannels(nowMs, platform);
 		} catch {
 			// Supervisor delivery must not fail because best-effort temp cleanup failed.
 		}
@@ -720,7 +726,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		refreshPendingRequests(pending, state, observeRequestLifecycle, runState);
 		const now = Date.now();
 		const channels = deps.getChannelDirs?.();
-		for (const { channelDir, file } of listRequestFiles(channels?.dirs)) {
+		for (const { channelDir, file } of listRequestFiles(channels?.dirs, platform)) {
 			if (seenFiles.has(file)) continue;
 			const request = parseRequestFile(file, channelDir);
 			if (!request || !requestMatchesOwner(request, state)) continue;
@@ -732,11 +738,15 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 				continue;
 			}
 			seenFiles.add(file);
-			if (request.expectsReply) {
-				rememberPendingRequest(request);
-				pending.set(request.id, request);
-				markForegroundSupervisorAttention(request, state);
+			if (!request.expectsReply) {
+				// Progress is already visible through child activity; do not inject a
+				// parent message or trigger a parent model turn.
+				removeRequestFile(request.requestFile);
+				continue;
 			}
+			rememberPendingRequest(request);
+			pending.set(request.id, request);
+			markForegroundSupervisorAttention(request, state);
 			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
 			// lose it, and must not abort the loop before the remaining asks register.
 			try {
@@ -755,25 +765,19 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 						...(request.childTarget ? { childTarget: request.childTarget } : {}),
 						...(request.interview !== undefined ? { interview: request.interview } : {}),
 						requestBody: request.message,
-						...(request.expectsReply ? { replyHint: supervisorReplyHint(request.id) } : {}),
+						replyHint: supervisorReplyHint(request.id),
 					},
 				}, { triggerTurn: true });
-				// sendMessage accepts synchronously; one-way updates stay on disk until it returns.
-				if (!request.expectsReply) removeRequestFile(request.requestFile);
 			} catch (error) {
-				// Allow an existing later scan to retry an unaccepted one-way update.
-				if (!request.expectsReply) seenFiles.delete(file);
 				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}
-			if (request.expectsReply) {
-				(pi as { events?: IntercomEventBus }).events?.emit(INTERCOM_DETACH_REQUEST_EVENT, {
-					requestId: request.id,
-					runId: request.runId,
-					agent: request.agent,
-					childIndex: request.childIndex,
-				});
-				if (pending.has(request.id)) markForegroundSupervisorAttention(request, state);
-			}
+			(pi as { events?: IntercomEventBus }).events?.emit(INTERCOM_DETACH_REQUEST_EVENT, {
+				requestId: request.id,
+				runId: request.runId,
+				agent: request.agent,
+				childIndex: request.childIndex,
+			});
+			if (pending.has(request.id)) markForegroundSupervisorAttention(request, state);
 		}
 		channels?.retire?.();
 	};
@@ -817,7 +821,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 		try {
 			channelEntries = fs.readdirSync(SUPERVISOR_CHANNEL_ROOT, { withFileTypes: true });
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			if (isMissingSupervisorDirectory(error, platform)) return;
 			startPolling();
 			return;
 		}
@@ -849,7 +853,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 			let files: string[];
 			try { files = fs.readdirSync(path.join(channelDir, REQUESTS_DIR)); }
 			catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				if (isMissingSupervisorDirectory(error, platform)) return [];
 				throw error;
 			}
 			const now = Date.now();
@@ -859,6 +863,11 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 					&& request.agent === target.agent && request.childIndex === target.childIndex
 					&& requestLifecycle(request, state, now, runState(request)) === "pending" ? [request.id] : [];
 			}).sort();
+		},
+		hasPendingRequests: () => {
+			if (!started) return false;
+			poll();
+			return pending.size > 0;
 		},
 		start: () => {
 			if (started) return;

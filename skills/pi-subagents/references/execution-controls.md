@@ -24,7 +24,7 @@ Project settings resolve from the nearest parent directory containing `.pi` or `
 
 An agent may set `runner.type: external-cli` with a non-empty `command`, optional string `args`, and `promptDelivery: stdin` (the default). The command runs with `shell: false`, inherits the resolved cwd and environment, and receives the combined agent instructions and task through stdin. It must already be installed; pi-subagents adds no CLI dependency.
 
-External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, nested subagents, fallbacks, and sessions are also unsupported.
+A command-runner agent with a plain `command` (no adapter) is also how a classifier or scoring script becomes a typed workflow step: the prompt arrives on stdin, stdout is the child's `output`, and the script parses it. Keep `inheritProjectContext`, `inheritGlobalContext`, and `inheritSkills` off unless the command wants that text. External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, nested subagents, and sessions are also unsupported.
 
 ### External job profiles
 
@@ -32,7 +32,7 @@ An agent may set `runner.type: external-job` with a non-empty `provider` and opt
 
 External job profiles are async-only. The provider owns the remote job and Pi owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
 
-External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool budgets, structured output, native child permissions, fallbacks, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
+External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool budgets, structured output, native child permissions, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
 
 ### Single agent
 
@@ -98,6 +98,8 @@ Scripts run in a timed worker with only `runs.run`, `runs.all`, `runs.status`, `
 If `runs.all` is missing in a running session, reload or update `pi-subagents` before retrying. The current runtime supports `runs.all`; `await Promise.all([runs.run(...)])` is also supported for advanced dynamic fanout.
 
 For one host-run verification command, pass `gate: "npm test"` on a `runs.run`/`runs.all` item (or at the top level as a workflow default). It is shorthand for verified acceptance with that single command: the runtime executes it on the host, records the result as evidence, and memoizes it per tracked workspace state and effective environment. `gate` cannot be combined with `acceptance`; use explicit `acceptance.verify` for multiple commands or custom criteria.
+
+For a typed post-run check, pass the object form `gate: { command, output: "json", schema?, timeoutMs? }`. A passing command must print one JSON document (under 12,000 characters); the parsed value, validated against `schema` when given, becomes the child's `structuredOutput`, so a script can branch on `result.structuredOutput` and `runs.lanes` blocks on `verdict === "blocked"` without the parent reading the child's output. Pair it with `output` + `outputMode: "file-only"` so the command reads the saved file. Empty, non-JSON, or schema-invalid stdout fails the gate and rejects the run. Typed gates are never memoized. A typed gate cannot be combined with an `outputSchema` from the launch or the agent; the launch is rejected before any child starts. See the `tool-reference` guide, "Typed gates".
 
 If omitted, acceptance is inferred from role, mode, and risk. Use `level: "checked"` for ordinary writer evidence and `level: "verified"` when the runtime should run explicit validation commands. Independent review is orthogonal: use `review: { required: true, agent: "reviewer" }`; reviewer/read-only calls omit `acceptance`. `review-required` means evidence passed but review is pending; `reviewed` means an independent review found no blockers. Never request `level: "reviewed"`; it is recognized only so preflight can return an actionable correction. Disable gates with `{ level: "none", reason: "..." }`; bare `"none"` is rejected and `false` is only a deprecated shorthand. Child-reported command success is evidence, not runtime verification.
 
@@ -248,9 +250,9 @@ Use diagnostics when setup or child startup looks wrong:
 subagent({ action: "doctor" })
 ```
 
-### Failed lane recovery and execution-mode fallback
+### Failed lane recovery and execution-mode changes
 
-A failure in the subagent workflow, child launch, prompt runtime, extension loading, or child tooling setup is a lane infrastructure blocker, not permission to silently change execution mode. Stop and report the exact failure, run/status, and repo/cwd/worktree/branch/ref state. Retry or fix the `subagent` path only through a clear same-protocol retry; before retrying or asking the owner, verify the worktree is clean or capture the partial diff. For backlog lanes and other subagent-governed workflows, switching to `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external mode requires explicit owner approval. Pi core may print a generic `pi -ne` extension-load hint; that hint is outside this package and is not protocol-approved fallback. This execution-mode boundary does not prohibit configured native model/provider fallback.
+A failure in the subagent workflow, child launch, prompt runtime, extension loading, or child tooling setup is a lane infrastructure blocker, not permission to silently change execution mode. Stop and report the exact failure, run/status, and repo/cwd/worktree/branch/ref state. Retry or fix the `subagent` path only through a clear same-protocol retry; before retrying or asking the owner, verify the worktree is clean or capture the partial diff. For backlog lanes and other subagent-governed workflows, switching to `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external mode requires explicit owner approval. Pi core may print a generic `pi -ne` extension-load hint; that hint is outside this package and is not protocol-approved. A verified compaction abort may continue the retained child session once on the same resolved model; provider failures never select another model automatically.
 
 ### External terminal work
 
@@ -491,7 +493,7 @@ subagent({
   workflowScript: `return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction, challenge assumptions, and propose the best next move." })`
 })
 
-// Implementation only after explicit approval. Worker defaults to forked context.
+// Implementation only after explicit approval. Worker defaults to fresh context.
 subagent({
   workflowScript: `return runs.run("implementation", { agent: "worker", task: "Implement the approved approach: ..." })`
 })

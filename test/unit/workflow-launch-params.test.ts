@@ -1,9 +1,37 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { prepareWorkflowLaunchParams, promptAuditRedoParams, resolveRevivalControlConfig, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import type { AgentConfig } from "../../src/agents/agents.ts";
+import { prepareWorkflowLaunchParams, promptAuditRedoParams, resolveRevivalControlConfig, resolveWorkflowChildLocalCwd, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
 import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
 
 describe("workflow launch params", () => {
+	it("keeps remote workflow cwd out of local discovery for explicit and agent-pinned machines", () => {
+		const workflowCwd = "/local/workflow";
+		const discoverCalls: string[] = [];
+		const pinned: AgentConfig = {
+			name: "pinned",
+			description: "Pinned agent",
+			systemPrompt: "Run remotely.",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/local/workflow/.pi/agents/pinned.md",
+			machine: "workmac",
+		};
+		const discoverAgents = (cwd: string) => {
+			discoverCalls.push(cwd);
+			return { agents: [pinned] };
+		};
+		const shared = { workflowCwd, discoverAgents, agents: [] as AgentConfig[] };
+
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "worker", machine: "workmac", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, []);
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "pinned", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, [workflowCwd]);
+	});
+
 	it("preserves omitted workflow child async defaults and awaits background resolution", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
@@ -270,6 +298,21 @@ describe("workflow launch params", () => {
 				workflowParentRunId: "workflow-run",
 				workflowKey: "gated",
 				acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
+			},
+		);
+	});
+
+	it("projects an object gate into a typed verify command", () => {
+		const gate = { command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 };
+		assert.deepEqual(
+			prepareWorkflowLaunchParams({}, { agent: "reviewer", task: "Review", gate }, "workflow-run", "typed"),
+			{
+				agent: "reviewer",
+				task: "Review",
+				workflowAwaitAsync: true,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "typed",
+				acceptance: { level: "verified", verify: [{ id: "gate", command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 }] },
 			},
 		);
 	});

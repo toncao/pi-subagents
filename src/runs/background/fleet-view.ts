@@ -339,7 +339,16 @@ function formatDetachedForegroundFleetLines(runs: ForegroundRun[]): string[] {
 	return lines;
 }
 
-function formatAsyncFleetLines(runs: AsyncRunSummary[]): string[] {
+function externalCliStepFacts(step: AsyncRunSummary["steps"][number], now: number): string | undefined {
+	if (step.runner?.type !== "external-cli") return undefined;
+	const process = step.externalProcess;
+	const elapsed = process
+		? process.durationMs ?? Math.max(0, (process.endedAt ?? now) - process.startedAt)
+		: undefined;
+	return `external-cli${elapsed !== undefined ? ` · ${formatDuration(elapsed)}` : ""}`;
+}
+
+function formatAsyncFleetLines(runs: AsyncRunSummary[], now = Date.now()): string[] {
 	if (runs.length === 0) return [];
 	const lines = ["Async runs:"];
 	for (const run of runs) {
@@ -357,7 +366,7 @@ function formatAsyncFleetLines(runs: AsyncRunSummary[]): string[] {
 			const phase = step.phase ? `[${step.phase}] ` : "";
 			const stepActivity = formatActivityFacts(step);
 			const modelThinking = formatModelThinking(step.model, step.thinking);
-			const parts = [`${step.index}. ${phase}${display}${stepContext ? ` ${stepContext}` : ""}`, step.status, stepActivity, modelThinking].filter(Boolean);
+			const parts = [`${step.index}. ${phase}${display}${stepContext ? ` ${stepContext}` : ""}`, step.status, externalCliStepFacts(step, now), stepActivity, modelThinking].filter(Boolean);
 			lines.push(`  ${parts.join(" | ")}`);
 			const output = path.join(run.asyncDir, `output-${step.index}.log`);
 			if (fs.existsSync(output)) lines.push(`    output: ${shortenPath(output)}`);
@@ -420,7 +429,7 @@ export function inspectSubagentFleet(_params: FleetViewParams, deps: FleetViewDe
 	if (foregroundLines.length) lines.push(...foregroundLines, "");
 	const detachedForegroundLines = formatDetachedForegroundFleetLines(detachedForegroundRuns);
 	if (detachedForegroundLines.length) lines.push(...detachedForegroundLines, "");
-	const asyncLines = formatAsyncFleetLines(asyncRuns);
+	const asyncLines = formatAsyncFleetLines(asyncRuns, deps.now?.() ?? Date.now());
 	if (asyncLines.length) lines.push(...asyncLines, "");
 	lines.push("Commands:");
 	lines.push("  Refresh fleet: subagent({ action: \"status\", view: \"fleet\" })");
@@ -525,14 +534,39 @@ function appendTranscriptBody(lines: string[], sourceLabel: string, sourceLines:
 	lines.push(...body.reverse());
 }
 
+function resolveWorkflowTranscriptChild(status: AsyncStatus, asyncDir: string, options: TranscriptOptions): { status: AsyncStatus; asyncDir: string } | undefined {
+	if (status.mode !== "workflow" || options.index === undefined) return undefined;
+	const step = status.steps?.[options.index];
+	if (step?.async !== true || typeof step.runId !== "string" || !/^[A-Za-z0-9_-]+$/.test(step.runId) || step.runId === status.runId) return undefined;
+	try {
+		const asyncRoot = fs.realpathSync(path.dirname(asyncDir));
+		const childDir = path.join(asyncRoot, step.runId);
+		if (fs.realpathSync(childDir) !== childDir || fs.lstatSync(path.join(childDir, "status.json")).isSymbolicLink()) return undefined;
+		const childStatus = readStatus(childDir);
+		return childStatus?.runId === step.runId
+			&& childStatus.parentWorkflowRunId === status.runId
+			&& typeof step.workflowKey === "string" && step.workflowKey.length > 0
+			&& childStatus.workflowKey === step.workflowKey
+			&& typeof status.sessionId === "string" && status.sessionId.length > 0
+			&& childStatus.sessionId === status.sessionId
+			? { status: childStatus, asyncDir: childDir }
+			: undefined;
+	} catch (error) {
+		if (isNotFoundError(error)) return undefined;
+		throw error;
+	}
+}
+
 export function formatAsyncRunTranscript(status: AsyncStatus, asyncDir: string, options: TranscriptOptions = {}): string {
+	const workflowChild = resolveWorkflowTranscriptChild(status, asyncDir, options);
+	if (workflowChild) return formatAsyncRunTranscript(workflowChild.status, workflowChild.asyncDir, { ...options, index: undefined });
 	const lineLimit = transcriptLineLimit(options.lines);
 	const selected = selectTranscriptStep(status, options);
 	const stepOutputPath = selected.index !== undefined ? path.join(asyncDir, `output-${selected.index}.log`) : undefined;
 	const runOutputPath = resolveMaybeRelative(asyncDir, status.outputFile);
 	const logPath = path.join(asyncDir, `subagent-log-${status.runId}.md`);
 	const outputPaths = selected.index !== undefined
-		? uniqueStrings([stepOutputPath, runOutputPath && stepOutputPath && path.resolve(runOutputPath) === path.resolve(stepOutputPath) ? runOutputPath : undefined])
+		? uniqueStrings([selected.step?.externalProcess?.finalOutputPath, stepOutputPath, runOutputPath && stepOutputPath && path.resolve(runOutputPath) === path.resolve(stepOutputPath) ? runOutputPath : undefined])
 		: uniqueStrings([runOutputPath]);
 	const sessionFile = selected.index !== undefined ? selected.step?.sessionFile : status.sessionFile;
 	const eventsPath = path.join(asyncDir, "events.jsonl");
@@ -553,12 +587,22 @@ export function formatAsyncRunTranscript(status: AsyncStatus, asyncDir: string, 
 	let transcriptLines: string[] = [];
 	let transcriptSource = "Transcript tail";
 	let truncated = false;
-	for (const outputPath of outputPaths) {
+	const externalProcess = selected.step?.runner?.type === "external-cli" ? selected.step.externalProcess : undefined;
+	const externalLogPaths = externalProcess ? [
+		{ path: externalProcess.stderrPath, label: "External stderr tail" },
+		{ path: externalProcess.stdoutPath, label: "External stdout tail" },
+	] : [];
+	const runningExternal = selected.step?.status === "running" && externalProcess;
+	const sources = runningExternal
+		? [...externalLogPaths, ...outputPaths.map((outputPath) => ({ path: outputPath, label: "Transcript tail" }))]
+		: [...outputPaths.map((outputPath) => ({ path: outputPath, label: "Transcript tail" })), ...externalLogPaths];
+	for (const source of sources) {
+		const outputPath = source.path;
 		const tail = readContainedTextTail(outputPath, lineLimit, [asyncDir], "output");
 		if (tail.error) warnings.push(`Output read failed for ${tail.path}: ${tail.error}`);
-		if (tail.lines.length === 0) continue;
+		if (!tail.lines.some((line) => line.trim().length > 0)) continue;
 		transcriptLines = tail.lines;
-		transcriptSource = `Transcript tail from ${tail.path}`;
+		transcriptSource = `${source.label} from ${tail.path}`;
 		truncated = tail.truncated;
 		break;
 	}

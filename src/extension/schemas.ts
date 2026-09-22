@@ -65,6 +65,11 @@ const JsonSchemaObject = Type.Unsafe({
 	description: "Strict structured output; object-root JSON Schema only.",
 });
 
+const OutputSchemaOverride = Type.Unsafe({
+	anyOf: [JsonSchemaObject, { type: "boolean" }],
+	description: "Structured output schema override; false disables an agent default.",
+});
+
 // Provider boolean branches intentionally overapproximate false-only runtime inputs.
 // Restricted function-declaration converters only support string enum members.
 const AcceptanceOverride = Type.Unsafe({
@@ -78,6 +83,7 @@ const AcceptanceOverride = Type.Unsafe({
 		},
 		{
 			type: "string",
+			pattern: "^\\s*\\{",
 		},
 		{ type: "boolean" },
 		{ type: "object", additionalProperties: true },
@@ -148,8 +154,9 @@ export const ParallelTaskSchema = Type.Object({
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label for this parallel task." })),
 	as: Type.Optional(Type.String({ description: "Optional safe identifier used as {outputs.name} in later chain steps." })),
-	outputSchema: Type.Optional(JsonSchemaObject),
+	outputSchema: Type.Optional(OutputSchemaOverride),
 	cwd: Type.Optional(Type.String()),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label." })),
 	count: Type.Optional(Type.Integer({ minimum: 1, description: "Repeat this parallel task N times with the same settings." })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
@@ -180,8 +187,9 @@ export const DynamicParallelTemplateSchema = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task template with {item}, {item.path}, {task}, {previous}, {chain_dir}, and {outputs.name} variables." })),
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label; item templates are supported." })),
-	outputSchema: Type.Optional(JsonSchemaObject),
+	outputSchema: Type.Optional(OutputSchemaOverride),
 	cwd: Type.Optional(Type.String()),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label." })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
 	reads: Type.Optional(ReadsOverride),
@@ -209,8 +217,9 @@ export const ChainItem = Type.Object({
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label for this chain step." })),
 	as: Type.Optional(Type.String({ description: "Optional safe identifier used as {outputs.name} in later chain steps." })),
-	outputSchema: Type.Optional(JsonSchemaObject),
+	outputSchema: Type.Optional(OutputSchemaOverride),
 	cwd: Type.Optional(Type.String()),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label." })),
 	output: Type.Optional(OutputOverride),
 	outputMode: Type.Optional(OutputModeOverride),
 	reads: Type.Optional(ReadsOverride),
@@ -333,7 +342,7 @@ const SubagentParamProperties = {
 		description: "create/update agent config; object or JSON string."
 	})),
 	workflow: Type.Optional(Type.String({ minLength: 1, description: "Extension-owned workflow resource." })),
-	args: Type.Optional(Type.Unsafe({ type: "object", maxProperties: 16, additionalProperties: true, description: "Bounded plain-JSON resource args." })),
+	args: Type.Optional(Type.Unsafe({ type: "object", maxProperties: 16, additionalProperties: true, description: "Bounded plain-JSON args for named, inline, or file-backed workflows; raw-script args are exposed deeply frozen and persisted, so do not include secrets." })),
 	workflowScript: Type.Optional(Type.String({ minLength: 1, description: "Inline JavaScript statement body; raw/unknown provenance, no runs.host. Use explicit return and top-level await; see tool guidance/guide workflows." })),
 	workflowScriptPath: Type.Optional(Type.String({ minLength: 1, description: "Raw script file; host reads from request cwd before sandbox. Mutually exclusive with workflowScript and workflow." })),
 	globalConcurrencyLimit: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -351,11 +360,13 @@ const SubagentParamProperties = {
 	async: Type.Optional(Type.Boolean({ description: "Background; default asyncByDefault. false only to block parent." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Timeout. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs." })),
 	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs (same defaults)." })),
+	checkpointBeforeDeadlineMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647, description: "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." })),
 	toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Per-tool deadline (ms); fast builtins default 5m." })),
 	toolBudget: Type.Optional(ToolBudgetOverride),
 	usageBudget: Type.Optional(UsageBudgetOverride),
 	agentScope: Type.Optional(Type.String({ description: "user/project/both (default); project wins collisions." })),
 	cwd: Type.Optional(Type.String({ description: "Execution/project-pane directory." })),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label; runs an external CLI agent there. cwd then means the directory on that machine." })),
 	artifacts: Type.Optional(Type.Boolean({ description: "Debug artifacts; default true." })),
 	includeProgress: Type.Optional(Type.Boolean({ description: "Full result progress; default false." })),
 	share: Type.Optional(Type.Boolean({ description: "Upload session to GitHub Gist; default false." })),
@@ -375,10 +386,16 @@ const SubagentParamProperties = {
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Child model provider/id; bare id only if unique. Suffix :off/minimal/low/medium/high/xhigh/max overrides agent thinking default." })),
 	fast: Type.Optional(Type.Boolean({ description: "Native OpenAI-Codex priority tier; default false, may cost more/quota." })),
-	outputSchema: Type.Optional(JsonSchemaObject),
+	outputSchema: Type.Optional(OutputSchemaOverride),
 	agentContract: Type.Optional(AgentContractOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
-	gate: Type.Optional(Type.String({ minLength: 1, description: "Host gate command. Cannot be combined with acceptance; an explicit acceptance of false is treated as omitted." })),
+	gate: Type.Optional(Type.Unsafe({
+		anyOf: [
+			{ type: "string", minLength: 1 },
+			{ type: "object", properties: { command: { type: "string", minLength: 1 }, output: { type: "string", enum: ["json"] }, schema: { type: "object" }, timeoutMs: { type: "integer", minimum: 1 } }, required: ["command"], additionalProperties: false },
+		],
+		description: "Host gate command run after the child finishes: a string, or { command, output: \"json\", schema?, timeoutMs? } whose passing stdout becomes structuredOutput (not with outputSchema). Cannot be combined with acceptance; an explicit acceptance of false is treated as omitted.",
+	})),
 };
 
 const SubagentParamsSchema = Type.Object(SubagentParamProperties);

@@ -6,6 +6,7 @@
  * observation channel, not a delivery acknowledgement.
  */
 
+import { statSync } from "node:fs";
 import { debuglog } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
@@ -27,6 +28,10 @@ export interface SubagentNotifyChildOutput {
 	agent?: string;
 	status: string;
 	savedOutputPath?: string;
+	outputArtifactPath?: string;
+	structuredOutputPath?: string;
+	outputArtifactError?: RetainedPathError;
+	structuredOutputError?: RetainedPathError;
 	preview: string;
 	previewTruncated?: boolean;
 	previewUnavailableReason?: string;
@@ -36,6 +41,7 @@ export type SubagentNotifyWatchdogBlocker = Pick<ChildWatchdogWarningSummary, "s
 
 export interface SubagentNotifyDetails {
 	workflowReceiptPath?: string;
+	asyncDir?: string;
 	agent: string;
 	status: "completed" | "failed" | "paused" | "stopped";
 	source?: "async" | "foreground";
@@ -90,9 +96,12 @@ export interface CompletionNotification {
 		success?: boolean;
 		output?: string;
 		structuredOutput?: unknown;
+		structuredOutputPath?: string;
 		outputState?: "present" | "absent" | "unknown";
 		outputReference?: string | { path?: string };
 		artifactPaths?: { outputPath?: string };
+		outputSaveError?: string;
+		artifactOutputSaveFailed?: true;
 		detached?: boolean;
 		exitCode?: number | null;
 		processSignal?: string | null;
@@ -119,6 +128,7 @@ export interface CompletionNotification {
 	intercomDelivered?: boolean;
 	parallelHandoff?: ParallelHandoffReference;
 	scheduleOrigin?: ScheduleOrigin;
+	asyncDir?: string;
 }
 
 interface NotifyTimerApi {
@@ -131,6 +141,7 @@ export interface RegisterSubagentNotifyOptions {
 	timers?: NotifyTimerApi;
 	now?: () => number;
 	ownership?: Pick<ResultDeliveryOwnership, "owns">;
+	sendRegistry?: CompletionSendRegistry;
 }
 
 export interface CompletionNotifier {
@@ -142,7 +153,14 @@ export interface CompletionNotifier {
 const CHILD_OUTPUT_PREVIEW_MAX_BYTES = 4 * 1024;
 const CHILD_OUTPUT_PREVIEW_COUNT = 8;
 const PREVIEW_TRUNCATION_MARKER = "...[preview truncated]";
+const COMPLETION_SEND_TTL_MS = 10 * 60 * 1000;
+const COMPLETION_SEND_REGISTRY_CAP = 4_096;
 type CompletionChild = NonNullable<CompletionNotification["results"]>[number];
+interface RetainedPathError { path: string; code?: string; message: string }
+type RetainedPathProjection =
+	| { status: "verified"; path: string }
+	| { status: "unavailable" }
+	| { status: "error"; error: RetainedPathError };
 
 function truncateUtf8Head(value: string, maxBytes: number): { text: string; truncated: boolean } {
 	const bytes = Buffer.from(value, "utf8");
@@ -171,10 +189,31 @@ function childSavedOutputPath(child: CompletionChild): string | undefined {
 	return outputPathFromReference(child.outputReference);
 }
 
+function nonemptyPath(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function retainedChildPath(value: unknown, producerConfirmed = false): RetainedPathProjection {
+	const path = nonemptyPath(value);
+	if (!path) return { status: "unavailable" };
+	if (producerConfirmed) return { status: "verified", path };
+	try {
+		return statSync(path).isFile() ? { status: "verified", path } : { status: "unavailable" };
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
+		if (code === "ENOENT" || code === "ENOTDIR") return { status: "unavailable" };
+		return { status: "error", error: { path, ...(code ? { code } : {}), message: error instanceof Error ? error.message : String(error) } };
+	}
+}
+
+function formatRetainedPathError(label: string, error: RetainedPathError): string {
+	return `  ${label} verification failed: stat ${error.code ? boundedSafeText(error.code, 32) : "unknown"}; path=${boundedSafeText(error.path, 384)}; ${boundedSafeText(error.message, 512)}`;
+}
+
 function childStatus(child: CompletionChild, workflowState?: string): string {
 	const knownStatus = child.status === "complete"
 		? "completed"
-		: child.status === "completed" || child.status === "failed" || child.status === "paused" || child.status === "stopped" || child.status === "detached"
+		: child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" || child.status === "stopped" || child.status === "detached"
 			? child.status
 		: undefined;
 	if (knownStatus) return knownStatus;
@@ -231,6 +270,11 @@ function formatChildOutputBlock(children: SubagentNotifyChildOutput[] | undefine
 		const status = boundedSafeText(child.status) || "unavailable";
 		lines.push(`- key=${key} run=${runId} status=${status}`);
 		lines.push(`  Saved output: ${child.savedOutputPath ? boundedSafeText(child.savedOutputPath) : "unavailable"}`);
+		if (child.outputArtifactPath) lines.push(`  Output artifact (retention-managed): ${boundedSafeText(child.outputArtifactPath)}`);
+		if (child.structuredOutputPath) lines.push(`  Structured output (retention-managed): ${boundedSafeText(child.structuredOutputPath)}`);
+		if (child.outputArtifactError) lines.push(formatRetainedPathError("Output artifact", child.outputArtifactError));
+		if (child.structuredOutputError) lines.push(formatRetainedPathError("Structured output", child.structuredOutputError));
+		if (child.previewTruncated && !child.savedOutputPath && !child.outputArtifactPath) lines.push("  Full output unavailable");
 		if (index >= CHILD_OUTPUT_PREVIEW_COUNT) {
 			lines.push("  Preview: unavailable (notice preview budget exceeded)");
 			continue;
@@ -267,6 +311,7 @@ function formatChildRun(child: { runId: string; workflowKey?: string; agent?: st
 
 function formatCorrelationLines(details: SubagentNotifyDetails): string[] {
 	return [
+		details.asyncDir ? `Retention-managed async directory: ${boundedSafeText(details.asyncDir)}` : undefined,
 		details.workflowRunId ? `Workflow run: ${details.workflowRunId}` : undefined,
 		details.childRuns?.length ? `Child runs: ${details.childRuns.map(formatChildRun).join(", ")}` : undefined,
 		details.reconciledFromDetachedChild ? `Reconciled detached child: ${details.reconciledFromDetachedChild}` : undefined,
@@ -320,6 +365,20 @@ export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 
 export function scheduledCompletionTriggersTurn(origin: ScheduleOrigin | undefined, outcome: string): boolean {
 	return !(origin?.quiet === true && outcome === "completed");
+}
+
+/**
+ * Child settlement is useful context, but an ordinary successful child does not
+ * establish the workflow's dependency barrier while its workflow is running.
+ * Keep actionable outcomes waking the parent, and preserve a terminal child as
+ * the barrier for hosts that do not emit a separate workflow completion wake.
+ */
+export function incrementalChildCompletionTriggersTurn(
+	child: Pick<IncrementalChildCompletion, "outcome" | "workflowRunning">,
+	origin: ScheduleOrigin | undefined,
+): boolean {
+	if (child.workflowRunning && child.outcome === "completed") return false;
+	return scheduledCompletionTriggersTurn(origin, child.outcome);
 }
 
 export function formatIncrementalChildCompletion(child: IncrementalChildCompletion): string {
@@ -436,7 +495,7 @@ const notificationDebug = debuglog("pi-subagents-notify");
 type TraceIdentity = Pick<CompletionNotification, "id" | "runId" | "source">;
 type NotificationReason = "disposed" | "missing_session" | "foreground_session_mismatch" | "not_owned"
 	| "intercom_delivered" | "deduped_ttl" | "deduped_pending" | "batch_deferred"
-	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_accepted" | "send_failed" | "dispose_pending";
+	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_joined" | "send_accepted" | "send_failed" | "dispose_pending";
 
 // Slice before sanitizing: diagnostic work and each identity are bounded even for
 // malformed result metadata. Never include task/output, paths, or error bodies.
@@ -464,6 +523,72 @@ interface PendingCompletion {
 	triggerTurn: boolean;
 	resolve(accepted: boolean): void;
 }
+
+export interface CompletionSendClaim {
+	owned: boolean;
+	outcome: Promise<boolean>;
+	settle?(accepted: boolean): void;
+}
+
+export interface CompletionSendRegistry {
+	claim(key: string, now: number): CompletionSendClaim;
+}
+
+interface CompletionSendEntry {
+	outcome: Promise<boolean>;
+	resolve(accepted: boolean): void;
+	deliveredAt?: number;
+}
+
+/** A fresh registry is injectable so tests and separately scoped runtimes stay isolated. */
+export function createCompletionSendRegistry(
+	ttlMs = COMPLETION_SEND_TTL_MS,
+	cap = COMPLETION_SEND_REGISTRY_CAP,
+): CompletionSendRegistry {
+	const entries = new Map<string, CompletionSendEntry>();
+	const prune = (now: number) => {
+		for (const [key, entry] of entries) {
+			if (entry.deliveredAt !== undefined && now - entry.deliveredAt > ttlMs) entries.delete(key);
+		}
+		if (entries.size <= cap) return;
+		for (const [key, entry] of entries) {
+			if (entries.size <= cap) break;
+			if (entry.deliveredAt !== undefined) entries.delete(key);
+		}
+	};
+	return {
+		claim(key, now) {
+			prune(now);
+			const existing = entries.get(key);
+			if (existing) return { owned: false, outcome: existing.outcome };
+			let resolve!: (accepted: boolean) => void;
+			const entry: CompletionSendEntry = {
+				outcome: new Promise<boolean>((settle) => { resolve = settle; }),
+				resolve: (accepted) => resolve(accepted),
+			};
+			entries.set(key, entry);
+			return {
+				owned: true,
+				outcome: entry.outcome,
+				settle(accepted) {
+					if (entries.get(key) !== entry) return;
+					if (accepted) {
+						entry.deliveredAt = now;
+						prune(now);
+					} else {
+						entries.delete(key);
+					}
+					entry.resolve(accepted);
+				},
+			};
+		},
+	};
+}
+
+const completionSendRegistrySymbol = Symbol.for("pi-subagents.completion-send-registry.v1");
+const processGlobal = globalThis as typeof globalThis & { [completionSendRegistrySymbol]?: CompletionSendRegistry };
+const processCompletionSendRegistry = processGlobal[completionSendRegistrySymbol]
+	?? (processGlobal[completionSendRegistrySymbol] = createCompletionSendRegistry());
 
 function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[]): boolean {
 	if (items.length === 0) return true;
@@ -508,8 +633,11 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		|| summary.startsWith("Paused after interrupt.")
 	);
 	const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" : "failed";
-	const taskInfo =
-		result.taskIndex !== undefined && result.totalTasks !== undefined
+	const runningChildren = (result.mode === "workflow" || agent === "workflow")
+		? result.results?.filter((child) => childStatus(child) === "running").length ?? 0 : 0;
+	const taskInfo = runningChildren > 0
+		? ` (${status === "completed" ? "dispatch complete; " : ""}${runningChildren} ${runningChildren === 1 ? "child" : "children"} running or uncollected)`
+		: result.taskIndex !== undefined && result.totalTasks !== undefined
 			? ` (${result.taskIndex + 1}/${result.totalTasks})`
 			: undefined;
 
@@ -559,12 +687,20 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 			const workflowKey = typeof child.workflowKey === "string" && child.workflowKey.trim() ? child.workflowKey.trim() : undefined;
 			const runId = typeof child.runId === "string" && child.runId.trim() ? child.runId.trim() : undefined;
 			const savedOutputPath = childSavedOutputPath(child);
+			const outputArtifact = child.artifactOutputSaveFailed === true ? { status: "unavailable" as const } : retainedChildPath(child.artifactPaths?.outputPath);
+			const structuredOutput = child.stopped === true || child.timedOut === true
+				? { status: "unavailable" as const }
+				: retainedChildPath(child.structuredOutputPath, child.structuredOutput !== undefined);
 			return {
 				...(workflowKey ? { workflowKey } : {}),
 				...(runId ? { runId } : {}),
 				...(typeof child.agent === "string" ? { agent: child.agent } : {}),
 				status: childStatus(child, result.state),
 				...(savedOutputPath ? { savedOutputPath } : {}),
+				...(outputArtifact.status === "verified" ? { outputArtifactPath: outputArtifact.path } : {}),
+				...(structuredOutput.status === "verified" ? { structuredOutputPath: structuredOutput.path } : {}),
+				...(outputArtifact.status === "error" ? { outputArtifactError: outputArtifact.error } : {}),
+				...(structuredOutput.status === "error" ? { structuredOutputError: structuredOutput.error } : {}),
 				...(inline.preview ? { preview: inline.preview } : { preview: "" }),
 				...(inline.truncated ? { previewTruncated: true } : {}),
 				...(inline.unavailableReason ? { previewUnavailableReason: inline.unavailableReason } : {}),
@@ -572,15 +708,18 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		})
 		: undefined;
 	const reconciledFromDetachedChild = typeof result.reconciledFromDetachedChild === "string" ? result.reconciledFromDetachedChild : undefined;
+	const asyncDir = nonemptyPath(result.asyncDir);
 	const watchdogBlockers: SubagentNotifyWatchdogBlocker[] = [];
-	const collectWatchdogBlockers = (owner: string, progress: ChildWatchdogProgress | undefined) => {
+	const watchdogConcerns: string[] = [];
+	const collectWatchdogFindings = (owner: string, progress: ChildWatchdogProgress | undefined) => {
 		for (const warning of progress?.warnings ?? []) {
-			if (warning.severity !== "blocker") continue;
-			watchdogBlockers.push({ agent: owner, summary: warning.summary, addressed: warning.addressed, stalemate: warning.stalemate });
+			if (warning.importance !== "high") continue;
+			if (warning.severity === "blocker") watchdogBlockers.push({ agent: owner, summary: warning.summary, addressed: warning.addressed, stalemate: warning.stalemate });
+			else watchdogConcerns.push(`${owner}: ${warning.summary}\nEvidence: ${warning.evidence}\nRecommended action: ${warning.recommendedAction}`);
 		}
 	};
-	collectWatchdogBlockers(agent, result.watchdog);
-	for (const child of result.results ?? []) collectWatchdogBlockers(typeof child.agent === "string" ? child.agent : agent, child.watchdog);
+	collectWatchdogFindings(agent, result.watchdog);
+	for (const child of result.results ?? []) collectWatchdogFindings(typeof child.agent === "string" ? child.agent : agent, child.watchdog);
 	const session =
 		result.shareUrl
 			? { label: "Session", value: result.shareUrl }
@@ -598,9 +737,10 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		status,
 		...(scheduleOrigin ? { scheduleOrigin } : {}),
 		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
+		...(asyncDir ? { asyncDir } : {}),
 		...(result.source ? { source: result.source } : {}),
 		...(taskInfo ? { taskInfo } : {}),
-		resultPreview,
+		resultPreview: watchdogConcerns.length ? `${resultPreview}\n\nHigh-importance watchdog concerns:\n${watchdogConcerns.map((warning) => `- ${warning}`).join("\n")}` : resultPreview,
 		...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
 		...(handoffPath ? { handoffPath } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
@@ -619,8 +759,9 @@ export default function registerSubagentNotify(
 ): CompletionNotifier {
 	const seen = new Map<string, number>();
 	const pending = new Map<string, Promise<boolean>>();
-	const ttlMs = 10 * 60 * 1000;
+	const ttlMs = COMPLETION_SEND_TTL_MS;
 	const now = options.now ?? Date.now;
+	const sendRegistry = options.sendRegistry ?? processCompletionSendRegistry;
 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
 	const batchers = new Map<string, CompletionBatcher<PendingCompletion>>();
 	let disposed = false;
@@ -648,8 +789,20 @@ export default function registerSubagentNotify(
 			(owned ? accepted : rejected).push(item);
 		}
 		settle(rejected, false);
-		const sent = sendCompletion(pi, accepted);
-		settle(accepted, sent, sent ? "send_accepted" : "send_failed");
+		const claimed: Array<{ item: PendingCompletion; claim: CompletionSendClaim }> = [];
+		for (const item of accepted) {
+			const claim = sendRegistry.claim(item.key, now());
+			if (claim.owned) {
+				claimed.push({ item, claim });
+				continue;
+			}
+			traceNotification("send_joined", item.trace);
+			void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
+		}
+		const claimedItems = claimed.map(({ item }) => item);
+		const sent = sendCompletion(pi, claimedItems);
+		for (const { claim } of claimed) claim.settle?.(sent);
+		settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
 	};
 	const getBatcher = (result: CompletionNotification) => {
 		const key = completionBatchKey(result);

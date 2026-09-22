@@ -28,6 +28,7 @@ Discovery notes:
 - Project discovery also reads legacy `.agents/**/*.md` files. If both `.agents/` and the project config agents directory define the same parsed runtime agent name, the project config directory wins.
 - Nested subdirectories are discovered recursively. `.chain.md` files do not define agents.
 - User and project settings can add extra recursive scan roots with `subagents.agentScanDirs`; fixed user/project agent directories keep higher priority than same-name agents from scan roots.
+- Use `subagents.agentExcludeDirs` to prune literal directory subtrees without disabling legacy agents. See [configuration.md](configuration.md#excluded-agent-directories-settings) for path resolution, scope, and exemptions.
 - Installed Pi packages can expose agent directories from either `{"pi-subagents":{"agents":["./agents"]}}` or `{"pi":{"subagents":{"agents":["./agents"]}}}` in their package manifest. Package agents load above builtins and below user/project agents.
 - Use `agentScope: "user" | "project" | "both"` to control discovery. `both` is the default, and project definitions win runtime-name collisions.
 
@@ -56,6 +57,10 @@ When `surf-cli` is installed and loaded, Surf can expose a `gpt-pro` package age
 If you disabled the old bundled `gpt-pro` workaround with `agentOverrides.gpt-pro.disabled`, remove that override before using Surf's package agent.
 
 The Pi async run remains the source of truth for status, artifacts, wake/wait, mission attachment, retention, and diagnostics.
+
+### Command-runner agents as typed steps
+
+`runner.type: external-cli` with a plain `command` (no `adapter`) runs any local executable as a subagent: the assembled prompt is written to stdin, stdout becomes the child's output, and the run gets the usual run id, status, mission entry, and workflow key. This is how a classifier, a scoring script, or a small evaluation model becomes a `runs.run` step. Such agents are async-only (workflows launch children async by default; a direct `async: false` call is refused), receive no forked transcript, and cannot produce `structuredOutput` themselves; parse their `output` in the workflow, or pair them with a [typed gate](tool-reference.md#typed-gates). Generic commands are local-only; saved-machine placement accepts only the code-owned adapters below.
 
 ### Advisory runner data boundary
 
@@ -215,10 +220,10 @@ You can override selected agent fields without copying the whole agent. Override
 }
 ```
 
-Supported override fields: `description`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
+Supported override fields: `description`, `machine`, `output`, `outputMode`, `defaultReads`, `model`, `defaultProvider`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritGlobalContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`.
 
 - `description` replaces the discovered description for builtin and custom agents, which lets list output show deployment-specific routing or model metadata.
-- Use `output: false`, `defaultReads: false`, `defaultContext: false`, or `acceptanceRole: false` to clear an inherited value.
+- Use `output: false`, `defaultReads: false`, `defaultContext: false`, `acceptanceRole: false`, or `machine: false` to clear an inherited value.
 - Use `tools: "inherit"` when that one role should omit its bundled or frontmatter tool allowlist and receive Pi's normal builtins (plus ambient extensions when it runs as a background child).
 - Project overrides beat user overrides.
 - Matching package, user, and project agents also receive override fields, which replace the same fields declared in their frontmatter. This lets a shared agent keep its persona while local settings choose the effective model, context, tools, or other supported options.
@@ -231,7 +236,32 @@ Disable and restore:
 - `subagent({ action: "eject", agent: "reviewer" })` copies a bundled builtin or package agent verbatim into the user or project agent dir (default `user`) as an editable custom file that shadows the original.
 - `subagent({ action: "reset", agent: "reviewer" })` deletes the scope's custom agent file and/or settings override entry, restoring the bundled default. It refuses if no bundled default exists (use `delete` for purely custom agents).
 
+A custom agent file that shadows a bundled agent replaces the bundled definition wholesale; it does not inherit omitted frontmatter, including `acceptanceRole`. Custom implementation profiles must declare `acceptanceRole: writer` explicitly when writer acceptance inference is intended. Without it, automatic acceptance uses lightweight attestation as described in the [frontmatter reference](#frontmatter-reference).
+
 `eject`, `disable`, `enable`, and `reset` accept `agentScope: "user" | "project"` and operate in one scope at a time. Project overrides still win over user ones, so a project-scope disable survives a user-scope `enable` until you target the project scope.
+
+## Running external CLI agents on a Herdr saved machine
+
+Native Pi and the six code-owned Claude Code, Codex, and Cursor profiles can run on a Herdr machine (`herdr machine add <target> --label <name>`). Herdr owns each visible agent process in a fresh no-focus pane; SSH is used only as bounded transport for Herdr RPC and ownership checks. Herdr's catalog is the host allowlist; raw ssh targets are rejected.
+
+`machine` is a top-level frontmatter key, a settings override (`subagents.agentOverrides.<agent>.machine`, project beats user, `false` clears a pin), and a launch option on the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. The launch option wins. Placement survives `subagent({ action: "disable" })`, `reset`, and model profile switches.
+
+`cwd` means the directory on that machine when a machine is set. An absolute path or `~/...` is used as given; a relative path joins the repo's configured machine root; with no cwd the root is used; with no root the launch fails closed naming the setting:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": { "claude-code": { "machine": "workmac" } },
+    "machines": { "workmac": { "cwd": "/home/nico/proj" } }
+  }
+}
+```
+
+`machines.<label-or-id>.env` is rejected. No local API key, vendor environment, expanded prompt resource, extension path, or callback is copied. Remote runs use the machine's own credentials and managed model registry. Bounded probes and ownership checks use a fixed machine-owned PATH without sourcing shell profiles.
+
+Placed external profiles are one-shot and stop-only: they cannot steer, resume, or claim a Pi supervisor. Their result is always `partial` and begins `[best-effort/unverified]`, because only bounded sanitized terminal snapshots are exposed; no vendor-private transcript, database, JSONL, or blob is used as authoritative settlement evidence. Reconnect observes the same pane and process without redispatching the prompt.
+
+pi-subagents never clones, pulls, or checks out on the machine. Generic `external-cli` commands and managed worktrees are rejected before launch; saved-machine placement accepts native Pi and only the six code-owned external profiles.
 
 ## Parent prompt discovery
 
@@ -274,7 +304,6 @@ excludeTools: bash
 extensions:
 subagentOnlyExtensions: ./tools/child-only-search.ts
 model: claude-haiku-4-5
-fallbackModels: openai-codex/gpt-5.6-luna:low, anthropic/claude-sonnet-4
 thinking: high
 systemPromptMode: replace
 inheritProjectContext: false
@@ -290,24 +319,21 @@ timeoutMs: 900000
 toolTimeoutMs: 600000
 acceptance: {"level":"none","reason":"lightweight lookup"}
 acceptanceRole: read-only
-completionGuard: false
 interactive: true
 maxSubagentDepth: 1
 allowNestedSubagents: true
+allowedAgents: scout, reviewer
 ---
 
 Your system prompt goes here.
 ```
 
-Simple-scalar list fields accept either a comma-separated form or a newline block list with one `- item` per line. This applies to `tools`, `excludeTools`, `defaultReads`, `skill`/`skills`, `skillPath`, `fallbackModels`, `extensions`, and `subagentOnlyExtensions`:
+Simple-scalar list fields accept either a comma-separated form or a newline block list with one `- item` per line. This applies to `tools`, `excludeTools`, `allowedAgents`, `defaultReads`, `skill`/`skills`, `skillPath`, `extensions`, and `subagentOnlyExtensions`:
 
 ```yaml
 tools:
   - read
   - mcp:github/search_repositories
-fallbackModels:
-  - openai-codex/gpt-5.6-luna:low
-  - anthropic/claude-sonnet-4
 ```
 
 Field notes:
@@ -320,10 +346,10 @@ Field notes:
 | `tools` | Strict child tool allowlist. Named extension tools must also have their provider loaded. `mcp:` entries select direct MCP tools when `pi-mcp-adapter` is installed. |
 | `excludeTools` | Optional child tool deny-list applied after normal tool resolution. With an explicit `tools` allowlist, matching names are removed; when `tools` is omitted, the names are excluded from the child session's default tool set. Unknown names are ignored by Pi without making the agent definition invalid. |
 | `allowNestedSubagents` | Set `true` to authorize the child-safe nested `subagent` runtime without making omitted `tools` an allowlist. Inherited depth and capability ceilings remain authoritative. |
+| `allowedAgents` | Restricts which canonical, case-sensitive agent names this agent may launch. Omitted adds no restriction; an empty list denies every descendant launch. This only narrows an existing nesting grant: `tools: subagent` or `allowNestedSubagents: true` is still required. Inherited/runtime allowlists are intersected and cannot be widened. |
 | `extensions` | Omitted means a background child loads the parent's ambient extensions; empty means no ambient extensions; list values load exactly those extensions. Foreground children never load ambient extensions, so for them only listed values apply. |
 | `subagentOnlyExtensions` | Extension paths loaded only in this agent's child sessions. Tools registered there are unavailable to the main agent unless also installed through normal Pi extension configuration. |
 | `model` | Default model. Bare ids prefer the current provider when possible, then unique registry matches. |
-| `fallbackModels` | Ordered backup models for retryable provider/model failures before any tool activity. After tool work, only an eligible native foreground or background read-only HTTP 429 can continue once on a compatible same-configured-provider model, reopening the exact retained file with a fixed continuation prompt rather than replaying the task. This shares one recovery allowance with compaction-abort recovery and preserves the original deadline/cancellation. Ordinary task/deadline failures and external runners do not gain this exception. Requires the owned builtin `read`/`ls` profile without wait, coordination, custom tools or configured tool budgets. Foreground denies any configured usage budget; background permits only an authoritative remaining token allowance, not cost or unknown coverage. Retained history alone is insufficient. See [supported configuration and compatibility limits](models.md#native-read-only-continuation-after-http-429). |
 | `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. |
 | `systemPromptMode` | `replace` by default; `append` keeps Pi's base prompt. |
 | `inheritProjectContext` | Keeps or strips inherited repository instruction blocks. |
@@ -339,14 +365,19 @@ Field notes:
 | `timeoutMs` | Positive integer default runtime deadline in milliseconds for single-agent launches. Foreground launches use 30 minutes when neither the call nor agent provides a timeout; explicit `timeoutMs`/`maxRuntimeMs` and agent defaults win. |
 | `toolTimeoutMs` | Optional positive integer hard per-tool-call deadline in milliseconds. An explicit call value wins, then this agent default, global `toolTimeoutMs`, and `PI_SUBAGENT_TOOL_TIMEOUT_MS`. When omitted, known-fast built-in tools get a five-minute default; long-running tools get attention notices but no hard default. It does not extend the run-level deadline; `contact_supervisor`, `intercom`, and `bg_wait` are exempt. |
 | `acceptance` | Acceptance default for single-agent launches. Use a scalar level such as `checked` or an inline/block YAML map such as `{ level: "none", reason: "lightweight lookup" }`. Explicit call values win; chain and parallel acceptance remains task/step configuration. |
-| `acceptanceRole` | Optional `read-only` or `writer` role for automatic acceptance inference. Explicit task mutation or no-edit intent wins; otherwise the declared role replaces agent-name guessing. This does not grant or revoke tools. |
-| `mutationTools` | Comma-separated extension tool names whose calls count as mutation attempts for the completion guard. This declares evidence only; list and load each tool through `tools` and its extension provider as usual. |
-| `completionGuard` | Set `false` only for non-implementation agents that may mention implementation words while using mutation-capable tools such as `bash`. |
+| `acceptanceRole` | Optional `read-only` or `writer` role for automatic acceptance inference. When omitted, automatic acceptance uses lightweight attestation; task wording and agent names do not escalate it. This does not grant or revoke tools. |
+| `mutationTools` | Comma-separated extension tool names treated as mutating activity for runtime diagnostics, long-running-tool status, and timeout recovery. This is diagnostic only and never determines successful completion. List and load each tool through `tools` and its extension provider as usual. |
 | `interactive` | Parsed for compatibility but not currently enforced. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent's children. |
 | `memory` | Opt-in role-specific persistent memory. See below. |
 
-When the completion guard would flag missing edits, a model intent arbiter can rescue only a confident read-only task. Foreground uses the parent model; native background uses the child attempt's existing model services after child shutdown. Ordinary completions do not invoke classification or resolve arbiter auth. Disabled arbitration (`PI_SUBAGENTS_LLM_INTENT_ARBITER=0`), unavailable model/auth, errors, ambiguous intent, and tasks over 8,000 characters keep the guard result. The classification prompt has a 10-second timeout; preceding auth and module loading are outside that bound. This does not change capability limits or the v1 contract's default-off guard and explicit missing-effect semantics.
+### Required host extensions
+
+Hosts can import `registerRequiredChildExtensions` from `pi-subagents/required-child-extensions` and register `{ sessionId, extensions: [{ id, path }] }`. Paths resolve to existing files and are canonicalized into an immutable launch snapshot; bounded safe IDs appear in evidence instead of paths. One registration is allowed per parent session until its idempotent `dispose()` runs, normally on `session_shutdown`.
+
+Required paths follow ordinary extension resolution and survive agent defaults and `extensions: []` across native foreground, detached, nested, and recovery launches. A `capabilityCeiling.denyExtensions` conflict or required load/provider-registration failure rejects before model resolution. External runners are excluded, and status/watch paths do not query the registry.
+
+Successful completion is determined by observable gates such as process outcome, required outputs, explicit acceptance, verification commands, independent review, and staged-index integrity. Best-effort mutation observations remain diagnostic: unchanged or unknown evidence does not fail a run, and observed changes do not prove correctness.
 
 ## Per-agent persistent memory
 
@@ -363,6 +394,7 @@ This is independent of Pi's own parent/session/project memory system and writes 
 How it works:
 
 - On each run, the first 200 lines of `MEMORY.md` in the resolved memory directory are injected into the child system prompt, so the agent can recall accumulated role notes such as threat-model entries, release gotchas, or verified commands.
+- Project memory resolves to the main checkout from standard linked Git worktrees whose metadata lives under `<main>/.git/worktrees/`, so isolated children share one durable role memory and worktree cleanup does not remove it. Custom `--separate-git-dir` layouts keep their current project-root behavior because Git does not retain a safely verifiable main-checkout path there.
 - Agents with write tools (`edit`, `write`, or `bash`, or no `tools` allowlist at all) are told they may append concise dated entries to the file.
 - Agents without write tools receive a read-only memory block and are not instructed to edit it. A read-only reviewer can recall prior notes without gaining write capability.
 - The memory directory is never created eagerly. The agent's own `write` tool creates it (and `MEMORY.md`) on the first persist.
@@ -404,20 +436,20 @@ How `tools` behaves:
 - `tools` present: regular tool names become an explicit allowlist.
 - `tools:` empty: the child session gets no tools.
 - `allowNestedSubagents: true`: explicitly enables child-safe nested fanout without turning omitted `tools` into an allowlist. Depth and inherited capability ceilings still apply.
+- `allowedAgents: scout, reviewer`: if nesting is separately enabled, restricts this agent's descendant launches to those names. `allowedAgents:` denies all descendants and omission is unrestricted except for inherited/runtime policy.
 
 `excludeTools` is applied after this resolution. It can narrow an explicit `tools` allowlist or, when `tools` is omitted, remove names from Pi's default builtin tool set. Runtime-injected tools are excluded only when their exact names are listed. An empty `excludeTools` list has no effect.
 
 An allowlisted name does not load the extension that registers it. Load that provider through `extensions`, `subagentOnlyExtensions`, a path-like `tools` entry, or (background children only) normal Pi extension discovery.
 
-Ambient extensions depend on where the child runs. Foreground children are sessions inside the parent Pi process and never load the parent's ambient extensions; otherwise the parent would start a second copy of each ambient extension, including this one. Background children are sessions inside the detached runner process and load the ambient extensions unless the agent sets `extensions` or the capability ceiling denies extensions. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as pi-mcp-adapter) or models from a provider extension must therefore run as background children (`async: true`). A foreground launch of such an agent fails with a diagnostic that says exactly that.
+Ambient extensions depend on where the child runs. Local foreground children are sessions inside the parent Pi process and never load the parent's ambient extensions; otherwise the parent would start a second copy of each ambient extension, including this one. Background children are sessions inside the detached runner process and load the ambient extensions unless the agent sets `extensions` or the capability ceiling denies extensions. Local foreground children do inherit the providers the parent's extensions registered (`pi.registerProvider`), so their models resolve without loading those extensions again. Pane-native remote foreground children instead use the remote machine's provider discovery and configuration. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as pi-mcp-adapter) must therefore run as background children (`async: true`). A foreground launch of such an agent fails with a diagnostic that says exactly that.
 
 More rules:
 
 - `mcp:` entries are split out and forwarded as direct MCP selections without granting normal builtins unless those builtins are also listed.
 - Path-like `tools` entries, such as extension paths or `.ts`/`.js` files, are treated as tool-extension paths rather than tool names.
 - Internal runtime tools such as `structured_output` are added to an explicit allowlist only when their contract is active.
-- Unknown extension tool calls count as mutation attempts only when their names are listed in `mutationTools`; undeclared unknown tools keep the no-edit guard active.
-- Agents that declare only known read-only builtin tools skip the implementation completion guard. `bash`, unknown tools, and MCP tools stay mutation-capable. Use `completionGuard: false` for bash-enabled validators or advisors that should never be judged as implementation agents.
+- Unknown extension tool calls are treated as mutating diagnostic activity only when their names are listed in `mutationTools`.
 
 Examples:
 
@@ -428,7 +460,7 @@ Examples:
 - `allowNestedSubagents: true` with `tools` omitted: normal builtin tools (and, for background children, ambient extensions) remain inherited, and the child-safe nested `subagent` runtime is added.
 - `tools: read, fixture_search` plus `subagentOnlyExtensions: ./tools/fixture-search.ts`: the provider loads only in this agent's child sessions, and the registered `fixture_search` name survives the strict allowlist.
 
-Direct MCP tools require [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter). Subagents only receive direct MCP tools when `mcp:` entries are listed in their frontmatter; global `directTools: true` in `mcp.json` is not enough by itself. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart Pi before relying on direct tools. Server `includeTools` and `excludeTools` policies are enforced while resolving cached metadata for children: both accept exact names and `*`/`?` glob patterns against raw, generated-resource, and server/short/none-prefixed names, with `excludeTools` taking precedence. `mcp:` entries must name servers from the adapter's configuration files. A server that exists only in the adapter's runtime snapshot (registered at runtime, not persisted) cannot be provided to a child: children are pi sessions inside the parent or the runner process, not `pi` processes that could receive an MCP config argument, so such a launch fails with an error saying that MCP tools must come from an ambient adapter extension in a background child. An `mcp:` entry named `subagent` does not authorize nested fanout; declare the builtin `subagent` tool or set `allowNestedSubagents: true`. If a resolved direct MCP name is missing from the child registry, pi-subagents keeps the launch failed under the strict allowlist and identifies the condition as a host/pi-mcp-adapter registration problem; verify that the adapter registers the selected tools before child startup.
+Direct MCP tools require [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter). Subagents only receive direct MCP tools when `mcp:` entries are listed in their frontmatter; global `directTools: true` in `mcp.json` is not enough by itself. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart Pi before relying on direct tools. Server `includeTools` and `excludeTools` policies are enforced while resolving cached metadata for children: both accept exact names and `*`/`?` glob patterns against raw, generated-resource, and server/short/mcp/none-prefixed names, with `excludeTools` taking precedence. `mcp:` entries must name servers from the adapter's configuration files. A server that exists only in the adapter's runtime snapshot (registered at runtime, not persisted) cannot be provided to a child: children are pi sessions inside the parent or the runner process, not `pi` processes that could receive an MCP config argument, so such a launch fails with an error saying that MCP tools must come from an ambient adapter extension in a background child. An `mcp:` entry named `subagent` does not authorize nested fanout; declare the builtin `subagent` tool or set `allowNestedSubagents: true`. If a resolved direct MCP name is missing from the child registry, pi-subagents keeps the launch failed under the strict allowlist and reports the registration mismatch; check the resolved names against what the host or pi-mcp-adapter actually registers before child startup.
 
 `extensions` controls child extension loading:
 
@@ -446,7 +478,7 @@ When `extensions` is present, normal discovered extensions are disabled. The lis
 
 Use `subagentOnlyExtensions` when a custom extension tool should exist only inside child sessions. It is scoped by agent config: every run of that agent receives those extension paths, while other agents do not unless they declare the same field. The current model does not have a separate named-subagent audience inside one agent definition.
 
-To apply the same `extensions` allowlist to every agent that does not declare its own, set `subagents.defaultExtensions` in user or project settings (see [configuration.md](configuration.md)).
+To apply a shared extension policy to every agent that does not declare its own, set `subagents.defaultExtensions` for an ambient-disabling allowlist or `subagents.defaultSubagentOnlyExtensions` for child-only paths that preserve ambient discovery (see [configuration.md](configuration.md)).
 
 Before the first model turn, the child runtime compares every explicit tool name with Pi's final filtered registry. A missing provider fails the run with the unavailable names and concrete `subagentOnlyExtensions`/`extensions` guidance, instead of letting a direct or chained child silently continue without its requested tools.
 
@@ -498,15 +530,15 @@ Agent-local `skillPath` candidates never enter Pi's parent/global skills catalog
 
 ## The bundled pi-subagents skill
 
-The package bundles a `pi-subagents` skill that is automatically available to the parent agent when the extension is installed. It is for the orchestrating parent only: child subagents never receive it, and their context is explicitly filtered to strip parent-only orchestration instructions.
+The package bundles a `pi-subagents` skill that is automatically available to the parent agent when the extension is installed. Availability is not automatic routing or permission to delegate: the parent works directly unless the operator requests delegation in the current request or through applicable user/project instructions. Once authorized, use the smallest bounded child or workflow whose evidence, independent review, specialization, parallelism, or isolation benefit earns its overhead. It is for the orchestrating parent only: child subagents never receive it, and their context is explicitly filtered to strip parent-only orchestration instructions.
 
 What it covers:
 
-- **Delegation patterns**: when to launch which agent, whether to use single, parallel, chain, or async mode, and whether to use fresh or forked context.
+- **Delegation patterns**: how to select a bounded agent and single, parallel, scripted, or async shape after delegation is authorized, including fresh or forked context.
 - **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command. This includes parallel review, review-loop, parallel research, parallel context-build, parallel handoff-plan, gather-context-and-clarify, and parallel cleanup.
 - **Role-agent prompting guidance**: compact contract prompts instead of long scripts, what to include in role-specific meta prompts, and retrieval budgets for researchers.
 - **Safety boundaries**: child agents must not run subagents unless their resolved builtin tools explicitly include `subagent`, must not invent intercom targets, and must escalate unapproved decisions.
 - **Intercom conventions**: when to ask vs send, and how parent-side supervisor/result delivery works through the native channel.
 - **Control and diagnostics**: attention signals, soft interrupts, status, and the `doctor` action.
 
-If you are writing an agent that orchestrates subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.
+If you are writing an agent that has been asked to orchestrate subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.

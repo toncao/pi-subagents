@@ -1,28 +1,25 @@
 ---
 name: pi-subagents
 description: |
-  Delegate to builtin or custom subagents for single-agent handoffs, parallel
-  review, scripted chaining, async work, forked context, and coordinated
-  workflows. Use when one parent agent should stay in control while children
-  supply focused context, planning, review, or execution.
+  Technical guidance for operator-requested delegation to builtin or custom
+  subagents: bounded handoffs, parallel review, scripted workflows, async work,
+  forked context, isolation, and coordinated execution.
 ---
 
 # Pi Subagents
 
-Choose a mode:
+The parent works directly by default. Invoke subagents only when the operator
+requested delegation in the current request or through applicable user/project
+instructions. Task size, complexity, risk, tool-call count, recipe fit, or an
+available specialist does not independently authorize delegation.
 
-- **Direct mode:** For tiny or focused work, the parent handles the task
-  directly; a single bounded child handoff is fine. Skip workflow ceremony.
-- **Orchestrator mode:** For substantial or delegated work, the parent is the
-  supervisor, arbiter, and authority holder—not the routine primary doer.
-  Subagents may own planning/design, scouting, implementation,
-  simplification/challenge, validation, and review as useful. The parent keeps
-  user intent, constraints, authority, routing, arbitration, final acceptance,
-  and publication.
-- A useful loop for substantial work is **writer → challenge/simplify → review**;
-  the parent arbitrates between steps, and tiny tasks can skip it.
-- Direct parent edits during orchestrator mode should be intentional, small
-  interventions with a brief reason.
+Once authorized, choose the smallest bounded shape that earns its token and
+elapsed-time overhead through concrete evidence, independent review,
+specialization, useful parallelism, or needed isolation. A single child is
+valid; writer, challenge, and review stages must each earn their overhead rather
+than becoming default ceremony. The parent keeps user intent, constraints,
+routing, arbitration, decisions, final acceptance, and publication authority,
+and may perform the work directly where it is the most efficient owner.
 
 Children do not spawn subagents unless the parent explicitly delegated fanout
 and their resolved `tools` allow `subagent`.
@@ -94,9 +91,9 @@ For exact API fields and worked examples, call `subagent({action:"guide",topic:"
 | List, create, edit, disable, eject, or expose agents/RPC | `references/management-authoring-rpc.md` |
 | Check safety constraints, recipes, or error handling | `references/constraints-and-recipes.md` |
 
-For complex work, read `prompting-and-roles.md` and `execution-controls.md`, then
-load `review-and-validation.md` and `constraints-and-recipes.md` before launch or
-review.
+For an authorized complex delegated workflow, read `prompting-and-roles.md` and
+`execution-controls.md`, then load `review-and-validation.md` and
+`constraints-and-recipes.md` before launch or review.
 
 ## Operating rules
 
@@ -104,6 +101,7 @@ review.
 - Keep the parent on the ordinary strong default model. Route workers/scouts to a fast capable tier, serious reviews to a strong tier, and top reasoning to bounded read-only critique.
 - Exact model names are deployment policy. Put them in user/project settings or profiles, not package guidance.
 - Give every child a compact meta-prompt checklist: objective; repo/cwd/ref; authority/edit boundary; relevant files/contracts and constraints; success/acceptance criteria; validation; expected output/report; and stop/ask conditions. See `references/prompting-and-roles.md`.
+- Before launching a writer for substantial mutation work, classify it as single-seam or multi-seam and partition multi-seam work across exclusive component owners, gates, and durable handoffs before an integration-only owner. See `references/multi-lane-orchestration.md`.
 - For mutation work, use an isolated lane/worktree when isolation, overlap, or concurrent juggling matters; keep one writer per cwd/worktree. See `references/multi-lane-orchestration.md` for lane mechanics.
 - Keep long/high-output validation out of chat: prefer `interactive_shell` dispatch/background monitors, bounded logs, or subagent-owned reports; return a concise summary plus report path unless same-turn output is required. Do not use `interactive_shell` as an implicit fallback for a failed `subagent` lane; see `references/execution-controls.md`.
 - Treat subagent workflow, child launch, prompt runtime, extension load, and child tooling setup failures as lane infrastructure blockers. Stop, report the exact failure and run/worktree state, verify a clean worktree or capture a partial diff, and use only a clear same-protocol retry or an owner-approved execution-mode fallback.

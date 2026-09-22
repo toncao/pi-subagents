@@ -1,5 +1,5 @@
 import type { ChildWatchdogProgress, ChildWatchdogWarningSummary } from "../shared/types.ts";
-import { SUBAGENT_WATCHDOG_WARNING_TYPE, type ResolvedWatchdogConfig, type WatchdogCadenceConfig, type WatchdogCategory, type WatchdogLspConfig } from "./types.ts";
+import { WATCHDOG_WARNING_CATEGORIES, WATCHDOG_WARNING_IMPORTANCES, type ResolvedWatchdogConfig, type WatchdogCadenceConfig, type WatchdogLspConfig } from "./types.ts";
 
 export const CHILD_WATCHDOG_WARNING_LIMIT = 20;
 
@@ -16,7 +16,6 @@ export interface ChildWatchdogConfig {
 	agentEndTimeoutMs: number;
 	maxWarnings: number | null;
 	model?: string;
-	fallbackModels?: string[];
 	thinking?: string | false;
 	lsp: WatchdogLspConfig;
 	stalemateRepeats: number;
@@ -34,6 +33,7 @@ export interface ChildWatchdogStatusEvent {
 	phase: ChildWatchdogPhase;
 	ts: number;
 	reason?: string;
+	warning?: ChildWatchdogWarningSummary;
 }
 
 export type ChildWatchdogStateSnapshot = ChildWatchdogProgress;
@@ -48,7 +48,6 @@ export function resolveChildWatchdogConfig(input: {
 	const enabled = input.config.enabled && (override?.enabled ?? input.config.children.enabled);
 	if (!enabled) return undefined;
 	const model = override?.model ?? input.config.children.model;
-	const fallbackModels = override?.fallbackModels ?? input.config.children.fallbackModels;
 	const thinking = override?.thinking ?? input.config.children.thinking;
 	const cadence = override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
 	return {
@@ -59,7 +58,6 @@ export function resolveChildWatchdogConfig(input: {
 		agentEndTimeoutMs: input.config.agentEndTimeoutMs,
 		maxWarnings: input.config.maxWarnings,
 		...(model ? { model } : {}),
-		...(fallbackModels !== undefined ? { fallbackModels: [...fallbackModels] } : {}),
 		...(thinking !== undefined ? { thinking } : {}),
 		lsp: { ...input.config.lsp },
 		stalemateRepeats: input.config.stalemateRepeats,
@@ -130,6 +128,9 @@ function childConfigLsp(value: unknown): WatchdogLspConfig {
 export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdogConfig | undefined {
 	if (!raw) return undefined;
 	const parsed = childConfigObject(JSON.parse(raw), "root");
+	if (Object.hasOwn(parsed, "fallbackModels")) {
+		throw new Error("Invalid child watchdog config: fallbackModels was removed; configure one model instead.");
+	}
 	if (parsed.enabled === false) return undefined;
 	if ("enabled" in parsed && parsed.enabled !== true) throw new Error("Invalid child watchdog config: enabled must be true or false.");
 	const thinking = parsed.thinking;
@@ -140,10 +141,6 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 	const agent = childConfigOptionalString(parsed, "agent");
 	const childIndex = childConfigOptionalIndex(parsed, "childIndex");
 	const model = childConfigOptionalString(parsed, "model");
-	const fallbackModels = parsed.fallbackModels;
-	if (fallbackModels !== undefined && (!Array.isArray(fallbackModels) || fallbackModels.some((value) => typeof value !== "string" || !value.trim()))) {
-		throw new Error("Invalid child watchdog config: fallbackModels must be an array of non-empty strings.");
-	}
 	return {
 		...(runId ? { runId } : {}),
 		...(agent ? { agent } : {}),
@@ -152,7 +149,6 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 		agentEndTimeoutMs: childConfigPositiveInteger(parsed, "agentEndTimeoutMs"),
 		maxWarnings: childConfigNullableNonNegativeInteger(parsed, "maxWarnings"),
 		...(model ? { model } : {}),
-		...(fallbackModels !== undefined ? { fallbackModels: (fallbackModels as string[]).map((value) => value.trim()) } : {}),
 		...(thinking !== undefined ? { thinking: thinking as string | false } : {}),
 		lsp: childConfigLsp(parsed.lsp),
 		stalemateRepeats: childConfigPositiveInteger(parsed, "stalemateRepeats"),
@@ -163,6 +159,15 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 export function isChildWatchdogStatusEvent(value: unknown): value is ChildWatchdogStatusEvent {
 	if (!value || typeof value !== "object") return false;
 	const event = value as Partial<ChildWatchdogStatusEvent>;
+	const warningValue = event.warning;
+	const warning = warningValue as Partial<ChildWatchdogWarningSummary>;
+	const validWarning = warningValue === undefined || (warningValue !== null && typeof warningValue === "object" && !Array.isArray(warningValue)
+		&& (warning.severity === "concern" || warning.severity === "blocker")
+		&& typeof warning.importance === "string" && (WATCHDOG_WARNING_IMPORTANCES as readonly string[]).includes(warning.importance)
+		&& typeof warning.category === "string" && (WATCHDOG_WARNING_CATEGORIES as readonly string[]).includes(warning.category)
+		&& typeof warning.summary === "string" && typeof warning.evidence === "string" && typeof warning.recommendedAction === "string"
+		&& typeof warning.addressed === "boolean" && typeof warning.stalemate === "boolean"
+		&& (warning.displayedAt === undefined || typeof warning.displayedAt === "string"));
 	return event.type === CHILD_WATCHDOG_STATUS_EVENT
 		&& typeof event.seq === "number"
 		&& Number.isInteger(event.seq)
@@ -170,7 +175,8 @@ export function isChildWatchdogStatusEvent(value: unknown): value is ChildWatchd
 		&& typeof event.ts === "number"
 		&& Number.isFinite(event.ts)
 		&& typeof event.phase === "string"
-		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase);
+		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase)
+		&& validWarning;
 }
 
 export function childWatchdogIsActive(snapshot: ChildWatchdogStateSnapshot | undefined): boolean {
@@ -190,44 +196,30 @@ export function acceptChildWatchdogEvent(input: {
 	const eventIndex = input.event.childIndex ?? input.event.stepIndex;
 	if (input.childIndex !== undefined && eventIndex !== input.childIndex) return undefined;
 	if (input.current && input.event.seq <= input.current.seq) return undefined;
+	const warnings = input.event.warning
+		? [...(input.current?.warnings ?? []), input.event.warning].slice(-CHILD_WATCHDOG_WARNING_LIMIT)
+		: input.current?.warnings;
 	return {
 		phase: input.event.phase,
 		seq: input.event.seq,
 		lastUpdate: input.event.ts,
 		...(input.event.reason ? { reason: input.event.reason } : {}),
-		...(input.current?.warnings?.length ? { warnings: input.current.warnings } : {}),
+		...(warnings?.length ? { warnings } : {}),
 	};
 }
 
-function childWatchdogWarningFromMessage(message: unknown): ChildWatchdogWarningSummary | undefined {
-	const candidate = message as { role?: unknown; customType?: unknown; details?: Record<string, unknown> } | undefined;
-	if (candidate?.role !== "custom" || candidate.customType !== SUBAGENT_WATCHDOG_WARNING_TYPE) return undefined;
-	const details = candidate.details ?? {};
-	if (details.severity !== "concern" && details.severity !== "blocker") return undefined;
-	if (typeof details.summary !== "string" || typeof details.evidence !== "string" || typeof details.recommendedAction !== "string") return undefined;
-	return {
-		severity: details.severity,
-		category: details.category as WatchdogCategory,
-		summary: details.summary,
-		evidence: details.evidence,
-		recommendedAction: details.recommendedAction,
-		...(typeof details.displayedAt === "string" ? { displayedAt: details.displayedAt } : {}),
-		addressed: false,
-		stalemate: details.state === "stalemate",
-	};
-}
-
-/** A watchdog warning message is appended; an assistant turn marks earlier warnings addressed. Undefined when unchanged. */
-export function applyChildWatchdogMessage(current: ChildWatchdogStateSnapshot | undefined, message: unknown, now = Date.now()): ChildWatchdogStateSnapshot | undefined {
-	const warning = childWatchdogWarningFromMessage(message);
-	if (warning) {
-		const warnings = [...(current?.warnings ?? []), warning].slice(-CHILD_WATCHDOG_WARNING_LIMIT);
-		return current ? { ...current, warnings } : { phase: "idle", seq: 0, lastUpdate: now, warnings };
-	}
+/** An assistant turn marks earlier warnings addressed. Undefined when unchanged. */
+export function applyChildWatchdogMessage(current: ChildWatchdogStateSnapshot | undefined, message: unknown): ChildWatchdogStateSnapshot | undefined {
 	if ((message as { role?: unknown } | undefined)?.role !== "assistant" || !current?.warnings?.some((entry) => !entry.addressed)) return undefined;
 	return { ...current, warnings: current.warnings.map((entry) => entry.addressed ? entry : { ...entry, addressed: true }) };
 }
 
 export function unresolvedChildWatchdogBlockers(progress: Pick<ChildWatchdogProgress, "warnings"> | undefined): ChildWatchdogWarningSummary[] {
 	return (progress?.warnings ?? []).filter((warning) => warning.severity === "blocker" && (!warning.addressed || warning.stalemate));
+}
+
+export function childWatchdogProgressForModel(progress: ChildWatchdogProgress | undefined): ChildWatchdogProgress | undefined {
+	if (!progress) return undefined;
+	const warnings = (progress.warnings ?? []).filter((warning) => warning.importance === "high");
+	return { ...progress, warnings: warnings.length ? warnings : undefined };
 }

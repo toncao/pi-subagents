@@ -3,7 +3,7 @@ import { createReadOnlyTools, convertToLlm, type ExtensionContext } from "@earen
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { buildModelCandidates, isContextOverflow, isRetryableModelFailureAttempt, resolveModelCandidate } from "../runs/shared/model-fallback.ts";
+import { resolveModelCandidate } from "../runs/shared/model-resolution.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
 import { opencodeSessionHeaders } from "../shared/opencode-session-headers.ts";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
@@ -12,11 +12,11 @@ import { loadWatchdogGuidance } from "./guidance.ts";
 import { boundWatchdogReviewText, type WatchdogReviewFunction, type WatchdogReviewRequest } from "./runtime.ts";
 import {
 	WATCHDOG_WARNING_CATEGORIES,
-	WATCHDOG_WARNING_CONFIDENCES,
+	WATCHDOG_WARNING_IMPORTANCES,
 	WATCHDOG_WARNING_SEVERITIES,
 	type ResolvedWatchdogConfig,
 	type WatchdogCategory,
-	type WatchdogConfidence,
+	type WatchdogImportance,
 	type WatchdogSeverity,
 	type WatchdogWarning,
 } from "./types.ts";
@@ -27,11 +27,11 @@ const WatchdogAskParams = Type.Object({ question: Type.String(), evidence: Type.
 
 const WatchdogWarnParams = Type.Object({
 	severity: Type.String({ enum: WATCHDOG_WARNING_SEVERITIES, description: "concern for actionable risk, blocker for a likely wrong or unsafe outcome" }),
+	importance: Type.String({ enum: WATCHDOG_WARNING_IMPORTANCES, description: "low or medium for user-only visibility; high when the parent model must receive the finding" }),
 	summary: Type.String({ description: "One concise sentence naming the issue." }),
 	evidence: Type.String({ description: "Specific evidence from the turn delta or inspected files." }),
 	recommendedAction: Type.String({ description: "Specific action the parent should take before accepting or continuing." }),
 	category: Type.Optional(Type.String({ enum: WATCHDOG_WARNING_CATEGORIES })),
-	confidence: Type.Optional(Type.String({ enum: WATCHDOG_WARNING_CONFIDENCES })),
 }, { additionalProperties: false });
 
 type WatchdogWarnParams = Static<typeof WatchdogWarnParams>;
@@ -182,8 +182,8 @@ function nonEmptyString(value: string, field: string): string {
 function toWatchdogWarning(params: WatchdogWarnParams): WatchdogWarning {
 	return {
 		severity: params.severity as WatchdogSeverity,
+		importance: params.importance as WatchdogImportance,
 		category: (params.category ?? "other") as WatchdogCategory,
-		confidence: (params.confidence ?? "medium") as WatchdogConfidence,
 		source: "main",
 		summary: nonEmptyString(params.summary, "summary"),
 		evidence: nonEmptyString(params.evidence, "evidence"),
@@ -197,7 +197,7 @@ function createWatchdogWarnTool(request: WatchdogReviewRequest): AgentTool<typeo
 		label: "Watchdog warning",
 		description: [
 			"Emit one actionable main-session watchdog warning.",
-			"Use only for medium/high confidence concerns or blockers that the parent should consider before accepting the work.",
+			"Set importance explicitly: low or medium for user-only visibility, high only when the parent model must receive the finding.",
 			"Do not use for nits, praise, informational notes, or clean reviews.",
 		].join(" "),
 		parameters: WatchdogWarnParams,
@@ -218,20 +218,25 @@ function createWatchdogWarnTool(request: WatchdogReviewRequest): AgentTool<typeo
 	};
 }
 
+export function formatWatchdogCwdSection(cwd: string): string {
+	if (/[\p{Cc}\p{Zl}\p{Zp}<>]/u.test(cwd)) throw new Error("Watchdog cwd cannot contain control, line-separator, or angle-bracket characters.");
+	return `<cwd>\n${cwd}\n</cwd>`;
+}
+
 export function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, options: { hasScope?: boolean; guidance?: string; hasDiff?: boolean } = {}): string {
 	const guidance = options.guidance?.trim();
 	return [
 		"You are the main-session subagent watchdog for Pi.",
-		`Working directory: ${ctx.cwd}`,
 		"Review only the supplied parent turn delta. Inspect repository files only when needed to verify a concrete concern.",
 		options.hasScope ? "Use the Current scope record alongside supplied activity evidence; an unrelated user question does not cancel older authorized work." : undefined,
 		`You are read-only. You may use ${options.hasDiff ? "read, grep, find, ls, and watchdog_diff (the full repo diff since the session baseline; pass a path to narrow it)" : "read, grep, find, and ls"}. Do not edit files, run shell commands, spawn agents, or mutate state.`,
 		"Emit warnings only by calling watchdog_warn. Freeform assistant text is ignored and must not be used to report warnings.",
-		"Emit only medium/high confidence actionable concerns or blockers: missed user constraints, correctness risks, test gaps that matter, unsafe changes, stale facts, loop risks, or scope drift.",
-		"Do not emit nits, style preferences, low-confidence guesses, informational notes, praise, or summaries.",
+		"Emit only actionable concerns or blockers: missed user constraints, correctness risks, test gaps that matter, unsafe changes, stale facts, loop risks, or scope drift.",
+		"Do not emit nits, style preferences, unsupported guesses, informational notes, praise, or summaries.",
 		"If the turn is clean, call no tools and end normally.",
 		"Use severity='blocker' only when the issue should stop acceptance until addressed; otherwise use severity='concern'.",
 		guidance ? `\nStanding instructions from WATCHDOG.md (project first, then user):\n${guidance}` : undefined,
+		`\n${formatWatchdogCwdSection(ctx.cwd)}`,
 	].filter((line): line is string => Boolean(line)).join("\n");
 }
 
@@ -256,32 +261,17 @@ export function createMainWatchdogReview(provider: WatchdogContextProvider, opti
 		if (!ctx) throw new Error("Main watchdog review cannot run without an active Pi extension context.");
 		const aborted = () => ctx.signal?.aborted || request.signal?.aborted;
 		if (aborted()) return { stopReason: "aborted" };
-		const inherited = !request.config.main.model && ctx.model ? fullModelId(ctx.model) : undefined;
-		const candidates = request.config.main.fallbackModels?.length
-			? buildModelCandidates(request.config.main.model ?? inherited, request.config.main.fallbackModels,
-				ctx.modelRegistry.getAvailable().map(toModelInfo), ctx.model?.provider, { primaryModelFromParent: Boolean(inherited) })
-			: [request.config.main.model];
-		for (let index = 0; index < candidates.length; index++) {
-			if (aborted()) return { stopReason: "aborted" };
-			const candidate = candidates[index];
-			const config = { ...request.config, main: { ...request.config.main, model: candidate === inherited ? undefined : candidate } };
-			try {
-				const attempt = await runWatchdogAttempt(ctx, { ...request, config }, options);
-				if (aborted()) return { stopReason: "aborted" };
-				if (!attempt.retryable || index === candidates.length - 1) return attempt.result;
-			} catch (error) {
-				if (aborted()) return { stopReason: "aborted" };
-				if (!(error instanceof WatchdogAuthError)) throw error;
-				if (isContextOverflow(error.message) || !isRetryableModelFailureAttempt({ error: error.message }) || index === candidates.length - 1) throw error.cause ?? error;
-			}
+		try {
+			return (await runWatchdogAttempt(ctx, request, options)).result;
+		} catch (error) {
+			if (error instanceof WatchdogAuthError) throw error.cause ?? error;
+			throw error;
 		}
-		throw new Error("No usable watchdog model candidates.");
 	};
 }
 
 async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReviewRequest, options: CreateMainWatchdogReviewOptions): Promise<{
 	result: Awaited<ReturnType<WatchdogReviewFunction>>;
-	retryable?: boolean;
 }> {
 	const selection = await resolveWatchdogReviewModel(ctx, request.config, {
 		currentThinkingLevel: options.getThinkingLevel?.(),
@@ -336,13 +326,14 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 			return { content: [{ type: "text", text: "Review yielded for clarification." }], details: {} };
 		},
 	});
+	const systemPrompt = buildWatchdogSystemPrompt(ctx, {
+		hasScope: request.hasScope,
+		guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd),
+		hasDiff: diffBaseline !== undefined,
+	});
 	const agent = new Agent({
 		initialState: {
-			systemPrompt: buildWatchdogSystemPrompt(ctx, {
-				hasScope: request.hasScope,
-				guidance: loadWatchdogGuidance(ctx.cwd, request.config.guidance.watchdogMd),
-				hasDiff: diffBaseline !== undefined,
-			}),
+			systemPrompt,
 			model: selection.model,
 			thinkingLevel: selection.thinkingLevel,
 			tools,
@@ -373,7 +364,6 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 	const stopReason = reason === "error" || reason === "aborted" || reason === "length" ? reason : "stop";
 	const error = terminal && "errorMessage" in terminal && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;
 	return {
-		result: clarification ? { clarification } : { stopReason },
-		retryable: !clarification && stopReason === "error" && !isContextOverflow(error) && isRetryableModelFailureAttempt({ error, messages: agent.state.messages, toolCount }),
+		result: clarification ? { clarification } : error ? { stopReason, errorMessage: error } : { stopReason },
 	};
 }

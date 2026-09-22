@@ -188,6 +188,20 @@ try {
 }
 
 describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not available" : undefined }, () => {
+	it("accepts object or false output schema overrides and rejects null", () => {
+		assert.ok(SubagentParams);
+		assert.ok(CompileSchema);
+		const validator = CompileSchema!(SubagentParams);
+		const base = { agent: "worker", task: "work" };
+		assert.equal(validator.Check({ ...base, outputSchema: { type: "object" } }), true);
+		assert.equal(validator.Check({ ...base, outputSchema: false }), true);
+		assert.equal(validator.Check({ ...base, outputSchema: null }), false);
+		assert.equal(validator.Check({ task: "work", chain: [{ agent: "worker", outputSchema: false }] }), true);
+		const collectSchema = schemas.DynamicCollectSchema;
+		assert.ok(collectSchema);
+		assert.equal(CompileSchema!(collectSchema).Check({ as: "all", outputSchema: false }), false);
+	});
+
 	it("includes context field and default precedence for fresh/fork execution mode", () => {
 		const contextSchema = SubagentParams?.properties?.context;
 		assert.ok(contextSchema, "context schema should exist");
@@ -213,6 +227,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(args?.type, "object");
 		assert.equal(args?.maxProperties, 16);
 		assert.match(String(args?.description ?? ""), /bounded plain-JSON/i);
+		assert.match(String(args?.description ?? ""), /inline.*file-backed.*deeply frozen.*persisted.*secrets/i);
 		const workflowScript = SubagentParams?.properties?.workflowScript;
 		assert.equal(workflowScript?.type, "string");
 		assert.equal(workflowScript?.minLength, 1);
@@ -251,8 +266,11 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(isolation?.type, "string");
 		assert.deepEqual(isolation?.enum, ["none", "worktree"]);
 		const gate = SubagentParams?.properties?.gate;
-		assert.equal(gate?.type, "string");
-		assert.equal(gate?.minLength, 1);
+		assert.equal(hasAnyOfType(gate, "string"), true);
+		assert.equal(hasAnyOfType(gate, "object"), true);
+		const gateObject = anyOfBranches(gate).find((branch) => branch.type === "object");
+		assert.deepEqual(gateObject?.required, ["command"]);
+		assert.deepEqual((gateObject?.properties as Record<string, JsonSchemaNode> | undefined)?.output?.enum, ["json"]);
 		assert.match(String(gate?.description ?? ""), /cannot be combined with acceptance/i);
 		const properties = SubagentParams?.properties as Record<string, JsonSchemaNode> | undefined;
 		assert.equal(properties?.task?.type, "string");
@@ -585,7 +603,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const reviewedRecoveryBranch = acceptanceStringBranches.find((branch) => Array.isArray(branch.enum) && branch.enum.includes("reviewed"));
 		assert.deepEqual(reviewedRecoveryBranch?.enum, ["reviewed"]);
 		assert.equal(reviewedRecoveryBranch?.deprecated, true);
-		assert.equal(acceptanceStringBranches.some((branch) => branch.enum === undefined), true, "acceptance should tolerate JSON-encoded object strings");
+		const acceptanceObjectStringBranch = acceptanceStringBranches.find((branch) => branch.enum === undefined);
+		assert.equal(acceptanceObjectStringBranch?.pattern, "^\\s*\\{", "acceptance should tolerate only object-shaped JSON strings");
 		assert.match(String(acceptanceSchema.description ?? ""), /omit for read-only\/review/i);
 		assert.match(String(acceptanceSchema.description ?? ""), /prefer object/i);
 		assert.match(String(acceptanceSchema.description ?? ""), /false disables; true invalid/i);
@@ -607,6 +626,12 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			assert.equal(validator.Check({ [field]: false }), true);
 			assert.equal(validator.Check({ [field]: true }), true);
 			assert.equal(validator.Check({ [field]: 123 }), false);
+		}
+		for (const acceptance of ["auto", "attested", "checked", false, { level: "checked" }, '{"level":"checked"}', '  \n {"level":"checked"}']) {
+			assert.equal(validator.Check({ agent: "worker", task: "Fix", acceptance }), true, `${JSON.stringify(acceptance)} acceptance should validate`);
+		}
+		for (const acceptance of ["cheked", "none", "verified", "not-json", '[{"level":"checked"}]']) {
+			assert.equal(validator.Check({ agent: "worker", task: "Fix", acceptance }), false, `${JSON.stringify(acceptance)} acceptance should not validate`);
 		}
 		const validValues = [
 			{ skill: "review" },

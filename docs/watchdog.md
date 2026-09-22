@@ -6,7 +6,7 @@ The watchdog is an opt-in second model that reviews what the agent just did and 
 
 | Timing | Trigger | Gate | Delivery |
 |---|---|---|---|
-| Boundary review | `agent_end` of every main or child turn | Repo changed | Steered into the transcript; the agent gets one continuation, then that turn is reviewed again |
+| Boundary review | `agent_end` of every main or child turn | Repo changed | Routed by finding importance; high is steered to the model, low/medium are persisted for the user only |
 | Main activity review | `agent_end`, with `clarification: true` | New delivered orchestration evidence; at most one additional review per user prompt | Same warning/clarification path, even without local edits |
 | Cadence review | Every `cadence.everyNTools` tool results, minimum 5 | Opt-in | Steered after the current tool, before the next step |
 | LSP pre-pass | Before boundary review | Changed TypeScript/JavaScript files | Diagnostics become watchdog findings without a model call |
@@ -38,37 +38,37 @@ That means: main every 10 tools, worker every 5, other children every 20, review
 
 ## What you see
 
-Every finding is an ordinary transcript message: expandable, scrollable, and persisted in session JSONL. A clean review shows nothing.
+Every finding requires `importance: low | medium | high`. Low and medium are persisted for the user but excluded from model context and continuations. High findings retain model-visible delivery. Severity independently controls thresholds and acceptance, so a low-importance blocker still blocks acceptance. Clean reviews show nothing.
 
 ```
 you ─▶ agent turn ─▶ edits repo ─▶ agent_end ─▶ watchdog review
                                              ├─ clean: turn ends
-                                             └─ warning: steered in; agent continues once
+                                             └─ warning: low/medium user entry, or high steered message
 ```
 
-Collapsed warnings show the title and evidence line. Expanded warnings show evidence, recommended action, category, and source:
+Collapsed warnings show the title and evidence line. Expanded warnings show evidence, recommended action, importance, category, and source:
 
 ```
 ● Subagent watchdog Blocker (displayed): Claims tests passed without running them
   Evidence: The transcript claims `npm test` passed but no test command appears in the tool log.
   Recommended action: Run the focused test before finishing.
-  Category: Test Gap · Source: main
+  Importance: High · Category: Test Gap · Source: main
 ```
 
 When consecutive boundary reviews raise the same warning, the agent is not making progress. After `stalemateRepeats` identical warnings in a row (default 3), the warning is shown as `stalemate`, no continuation is triggered, and the turn ends. Your next prompt resets the count.
 
 Child watchdog findings are lifted into the parent in three ways:
 
-- The result envelope contains `watchdog.warnings` with severity, category, summary, evidence, recommended action, `addressed`, and `stalemate`, bounded to the last 20.
+- Internal/user inspection retains the last 20 findings, including importance and full details. Parent model results may include only high-importance findings.
 - The acceptance runtime check `watchdog-blocker` fails on blockers that are unaddressed or stalemate.
-- Completion notices include `Watchdog blockers:` lines, and Fleet/status views show `wd:<n>` plus `resolve watchdog blockers`.
+- Completion notices may include high-importance concerns and blockers; low/medium finding text is omitted.
 
 `/subagents-watchdog status` shows setting sources, enabled state, runtime state, review trigger, scope, cadence, LSP status, selected model/thinking, child overrides, timeout, stalemate count, launch-rule count, review backend, last warning, changed paths, and config errors when present.
 
 ## What the reviewer is given
 
 - **Turn delta** with changed repo paths. Over-long input keeps the first 6,000 characters and the tail.
-- **Current scope** (`scope.enabled`, default on): bounded real user prompts. Side questions are additive; only explicit changes supersede older requirements.
+- **Current scope** (`scope.enabled`, default on): bounded real user prompts. Side questions are additive; only explicit changes supersede older requirements. Scope survives compaction within the current session.
 - **`watchdog_diff`** when inside git: diff since the session-start commit, including later commits, plus untracked paths to inspect with `read`; accepts `path` and `stat:true`.
 - **`WATCHDOG.md`** standing instructions, read fresh on every review: `<project>/.pi/WATCHDOG.md` first, then `~/.pi/agent/WATCHDOG.md`, capped at 8,000 characters. Set `guidance.watchdogMd: false` to ignore them.
 - **LSP diagnostics** from `typescript-language-server`, auto-detected in `node_modules/.bin` or `PATH`; it is never installed and never run over the whole workspace. Errors become blockers, warnings concerns, and info/hints stay in status.
@@ -108,9 +108,7 @@ When a main watchdog model is configured (including a session override), recomme
 
 Omit `main.model` to inherit the session model and thinking level. A `main.model` without a thinking suffix or `main.thinking` runs with thinking off, so prefer `:high` for the strong pairing.
 
-Set `fallbackModels` in JSON settings on `main`, `children`, or `children.overrides.<agent>` to opt into an ordered fallback chain, for example `"fallbackModels": ["openai-codex/gpt-5.5:high"]`. Child overrides win over `children.fallbackModels`; neither inherits the main watchdog's chain. Arrays replace across user → project → session settings, and `[]` clears an inherited chain. Status shows configured chains.
-
-Unavailable configured candidates are skipped and resolved duplicates are tried once. Each attempt uses a fresh reviewer with its own model auth, provider stream, and thinking; an inherited primary keeps the actual session model/thinking, while fallbacks use explicit-model thinking rules. Fallback follows normal subagent provider-failure semantics (including rate limits, quota, auth, unavailability, and provider timeouts), **only before any tool work**, including read-only inspection. Clean/normal completion, length limits, findings, clarification, cancellation, and the overall watchdog deadline never trigger fallback. All attempts share the original deadline; exhaustion remains a failed review. With no fallback chain, existing single-model behavior is unchanged.
+The watchdog resolves one reviewer model and makes one review call. Unavailable models fail visibly; rate limits, quota, authentication, provider timeouts, findings, clarification, cancellation, and the overall watchdog deadline never switch models automatically. An inherited model keeps the current session model and thinking level.
 
 Agents can call `subagent({ action: "watchdog.recommend-model" })` and `subagent({ action: "watchdog.configure", model: "recommended", scope: "session" | "user" | "project" })`. They should use `scope: "session"` unless you ask for a lasting default.
 
@@ -140,7 +138,7 @@ Reviews retain the existing `agentEndTimeoutMs`. Questions and evidence are capp
 
 ## Child watchdogs
 
-Opt in under `subagents.watchdog.children`. `model`, `fallbackModels`, and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `fallbackModels`, `thinking`, `enabled`, or `cadence` per role.
+Opt in under `subagents.watchdog.children`. `model` and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `thinking`, `enabled`, or `cadence` per role.
 
 ## Launch rules
 
@@ -183,3 +181,5 @@ Values are `allow`, `ask`, and `deny`. Agent rules override global ones, omitted
 `ask` pauses that exact tool call and sends a bounded, redacted preview to a one-call arbiter owned by the child watchdog, using the configured child-watchdog model. The arbiter returns only `approve` or `deny` and does not notify the parent. A disabled watchdog, missing model/auth, timeout, malformed response, or runtime error denies the call with a clear error. Requests and decisions are written to bounded audit JSONL. `contact_supervisor` and the optional `pi-intercom` extension are never permission-gated.
 
 Bash is always passed through; bash rules are rejected. Use `pi-guard` for command-level policy. Children are pi sessions inside the parent process (foreground) or the detached runner process (background), not separate `pi` binaries, so there is no per-child command wrapper; load `pi-guard` into a child through the agent's `extensions` or `subagentOnlyExtensions`, and background children also pick it up as an ambient extension. External CLI profiles are opaque processes, so native permissions cannot intercept their tools; launches with effective `ask` or `deny` rules are rejected for external CLI agents.
+
+Detached runners receive `PI_SUBAGENT_PARENT_SESSION` from their exact launch and retain it for that dedicated process. Root and in-process foreground hosts do not publish a global parent identity because multiple Pi sessions can share a host. Environment-only permission extensions therefore cannot safely forward foreground `ask` requests; that path remains unsupported until the extension accepts a session-scoped target. Native child permissions are unaffected.

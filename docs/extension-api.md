@@ -114,7 +114,7 @@ pi.events.emit("subagents:rpc:v1:request", {
 });
 ```
 
-The RPC methods are `ping`, `status`, `manage`, `spawn`, `steer`, `interrupt`, `stop`, and `resume`. `status`, `manage`, `steer`, `interrupt`, and `resume` reuse normal package-owned actions.
+The RPC methods are `ping`, `status`, `manage`, `spawn`, `steer`, `interrupt`, `stop`, `resume`, and `cost`. `status`, `manage`, `steer`, `interrupt`, and `resume` reuse normal package-owned actions.
 
 Method notes:
 
@@ -122,6 +122,7 @@ Method notes:
 - `spawn` accepts structured single-child execution (`agent`, `task?`), inline `workflowScript`, or `workflowScriptPath` and is async-only: omit `async` or set `async: true`, omit `clarify`, and do not pass management `action` values. Relative script paths resolve against the request `cwd`. It goes through the same executor as the `subagent` tool, so agent discovery, validation, session attribution, configured spawn caps, child-safety depth, artifacts, and async status all behave the same.
 - `steer` requires an async run `id` (plus optional child `index`) and a non-empty `message`; its reply preserves the normal acknowledged-delivery result. Optional `mode` values are `steer` (default), `follow_up`, and `auto`, and receipts include `deliveryStatus: "delivered" | "queued"`. RPC steering disables the direct tool's pause-and-revive recovery in every mode so an extension keeps authority over the exact child it spawned; `ping.capabilities.nonRecoveringSteer` advertises this guarantee.
 - `resume` requires a run target and non-empty `message`. It delegates to the existing revival path, which validates current-session ownership, persisted session/recovery metadata, stopped/live state, capability ceilings, and the exclusive session lease before returning the new async run details. Callers may request a `file-only` output path for the revived result without overriding its model, tools, or budgets. `ping.capabilities.resume` advertises this seam.
+- `cost` returns the same parent-plus-child accounting `/subagent-cost` renders, as data: `{ version: 1, parent, children, childTotal, total, unresolvedAsyncChildren }`, where each usage is `{ input, output, cacheRead, cacheWrite, cost, turns }` and each child carries `label`, `agent`, `runId`, `usage`, and `sessionFile` when known. It is read-only and walks the current session branch plus existing run artifacts, so request it on your own turn boundaries (for example after `agent_settled` or an async completion wake), not on a timer. `unresolvedAsyncChildren` counts async children whose metadata could not be read; treat `childTotal` as a lower bound when it is non-zero, exactly as documented for `/subagent-cost` in [observability.md](observability.md). `ping.capabilities.cost` advertises `{ version: 1 }`.
 - `stop` targets current-session top-level async runs through the stop control channel and records a `stopped` lifecycle instead of reporting a timeout.
 - `status` keeps targeted and rich requests on the executor-backed path. A request with no `id`, `runId`, `dir`, `index`, `view`, or `lines` may use the restored in-memory projections and a short summary; when the live state is missing, stale, session-mismatched, or not restored, it falls back to normal executor status. Status `view`, `lines`, and `index` are forwarded for targeted transcript/fleet requests. Successful replies retain `text`, `details`, `fleet`, and `asyncSnapshot`; the short summary intentionally omits canonical filesystem details, wait subscriptions, and budget annotations.
 
@@ -136,6 +137,7 @@ Capability advertisements on `ping`:
 - `resume` — the revival seam described above.
 - `statusProjection: { version: 1, untargeted: "in-memory-when-ready", targeted: "executor" }` — untargeted status may use restored bounded projections; targeted or rich status remains executor-backed.
 - `fleetStatus: { version: 1 }` — successful `status` replies additionally include `data.fleet`.
+- `cost: { version: 1 }` — the `cost` method is available and returns the versioned report shape above.
 
 Structured delegation progress updates carry `runId` as soon as foreground execution allocates it, so a caller can retain the package-owned revival target even if its own tool turn is interrupted before the terminal response. Foreground `details.results[]` rows also include a numeric `index` that is unique within the run and stable across partial progress snapshots and the final result; use `(runId, index)` instead of row position to correlate single, counted parallel, and chain children.
 
@@ -187,6 +189,8 @@ const registration = request.result.registration;
 ```
 
 If `pi-subagents` is a resolvable dependency of the consumer package, `pi-subagents/agents` exports `RUNTIME_AGENT_REGISTER_EVENT`, the request/result types, and `registerAgentViaEvents()` for the same contract. A separately installed Pi package is not automatically a Node dependency of another package. In that case, use the event contract directly instead of a runtime import. A type-only development dependency is optional.
+
+A registered agent follows the operator's subagent model settings like any other agent: `subagents.defaultModel`, `defaultProvider`, and `defaultThinking` fill a definition that omits `model` or `thinking`, and the `model`, `defaultProvider`, `fast`, and `thinking` fields of `agentOverrides.<name>` win over the definition. Every other definition field stays extension-owned, and other override fields are ignored for runtime agents. Set `model` in the definition only when the agent must not follow operator model settings; `model: "inherit"` selects the parent session model explicitly.
 
 The installed owner applies the existing runtime-agent validation, collision checks, limits, runtime source metadata, and cleanup. If more than one owner listens, the first handler that writes `request.result` wins. Unsupported versions, malformed requests, and registration failures return `{ ok: false, error }`. No result means no compatible owner handled the event.
 
@@ -329,7 +333,7 @@ Identity:
 Results:
 
 - Result mode is explicit. Text remains literal even when it looks like JSON. Structured mode returns the separately captured, schema-validated JSON value.
-- Terminal usage reports input, output, cache-read, cache-write, cost, turns, tool calls, and duration alongside the effective model and thinking level when known.
+- Terminal usage reports input, output, cache-read, cache-write, cost, turns, tool calls, and duration alongside the effective model and thinking level when known. Native child totals are reconciled per attempt from post-prompt session messages: complete persisted fields replace live aggregates, while incomplete fields retain them.
 
 Live update events are bounded progress snapshots, not patches, so consumers should replace the prior snapshot rather than merge it as a delta. Structured delegation coalesces heartbeats whose delegation-visible progress and recent output are unchanged; a duration-only heartbeat therefore does not produce another update. The terminal response remains authoritative for the complete result, error, and final usage details.
 
@@ -410,7 +414,7 @@ Semantics:
 
 Children do not gain provider tools or extensions automatically. Add `bg_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting reaches every child through its typed runtime config; `PI_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence in the parent.
 
-Foreground children never load the parent's ambient extensions: they share the parent's process, and loading them would start a second copy of every ambient extension, including this one, inside it. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as pi-mcp-adapter) or models from a provider extension must run as background children (`async: true`), which load the ambient extensions inside the detached runner process unless the agent sets `extensions` or the capability ceiling denies extensions.
+Local foreground children never load the parent's ambient extensions: they share the parent's process, and loading them would start a second copy of every ambient extension, including this one, inside it. They do inherit the providers the parent's extensions registered, so a provider extension's models resolve in a local foreground child. Pane-native remote foreground children instead use the remote machine's provider discovery and configuration. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as pi-mcp-adapter) must run as background children (`async: true`), which load the ambient extensions inside the detached runner process unless the agent sets `extensions` or the capability ceiling denies extensions.
 
 ## External job provider bridge
 
@@ -559,3 +563,7 @@ The main runtime files in this repository:
 | `src/intercom/intercom-bridge.ts` | Runtime intercom bridge instructions and diagnostics. |
 | `src/extension/schemas.ts` / `src/shared/types.ts` | Tool schemas, shared types, and event constants. |
 | `test/unit/` / `test/integration/` | Unit and loader-based integration tests. |
+
+### Published package vs source checkout
+
+The npm tarball ships TypeScript compiler output with the same file layout and a compiled `index.js` entry. A Git checkout continues to run `index.ts` directly, so local extension development does not require a build step. Run `npm run pack:pkg` to build and pack the same artifact published to npm.

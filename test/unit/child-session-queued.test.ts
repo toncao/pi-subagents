@@ -31,6 +31,37 @@ describe("childSessionHasQueuedMessages", () => {
 });
 
 describe("default factory queued-message probe", () => {
+	it("rejects a required loader failure before requested-model resolution", async () => {
+		let modelResolved = false;
+		const requiredPath = "/tmp/required-provider.mjs";
+		const factory = createDefaultChildSessionFactory({
+			loadPiCodingAgent: async () => ({
+				ModelRuntime: { create: async () => ({ refresh: async () => {} }) },
+				SettingsManager: { create: () => ({}) },
+				DefaultResourceLoader: class {
+					async reload() {}
+					getExtensions() { return { extensions: [], errors: [{ path: requiredPath, error: "import failed" }], runtime: { pendingProviderRegistrations: [], pendingNativeProviderRegistrations: [] } }; }
+				},
+				resolveCliModel: () => { modelResolved = true; return {}; },
+			} as unknown as PiCodingAgentModule),
+		});
+		await assert.rejects(() => factory.create({ cwd: process.cwd(), storage: { kind: "memory" }, model: "provider/model", extensionPaths: [requiredPath], requiredExtensions: [{ id: "provider", path: requiredPath }], ambientExtensions: false, hooks: [], noSkills: true, noContextFiles: true, runtime: { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false } as ChildSessionLaunch["runtime"] }), /Required child extension failed to load/);
+		assert.equal(modelResolved, false);
+	});
+
+	it("rejects a required provider-registration failure before requested-model resolution", async () => {
+		let modelResolved = false;
+		const requiredPath = "/tmp/required-provider.mjs";
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => ({
+			ModelRuntime: { create: async () => ({ registerProvider() { throw new Error("bad provider"); }, refresh: async () => {} }) },
+			SettingsManager: { create: () => ({}) },
+			DefaultResourceLoader: class { async reload() {} getExtensions() { return { extensions: [], errors: [], runtime: { pendingProviderRegistrations: [{ name: "required", config: {}, extensionPath: requiredPath }], pendingNativeProviderRegistrations: [] } }; } },
+			resolveCliModel: () => { modelResolved = true; return {}; },
+		} as unknown as PiCodingAgentModule) });
+		await assert.rejects(() => factory.create({ cwd: process.cwd(), storage: { kind: "memory" }, model: "provider/model", extensionPaths: [requiredPath], requiredExtensions: [{ id: "provider", path: requiredPath }], ambientExtensions: false, hooks: [], noSkills: true, noContextFiles: true, runtime: { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false } as ChildSessionLaunch["runtime"] }), /provider registration failed.*bad provider/);
+		assert.equal(modelResolved, false);
+	});
+
 	it("reports no queued messages for an agent-less wrapped session", async () => {
 		const factory = createDefaultChildSessionFactory({
 			loadPiCodingAgent: async () => ({

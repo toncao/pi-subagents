@@ -16,10 +16,10 @@ import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-
 const sdkRoot = process.env.PI_SUBAGENTS_NATIVE_SDK;
 for (const host of ["foreground", "runner"] as const) {
 	for (const [systemPromptMode, structured] of [["append", false], ["replace", false], ["append", true], ["replace", true]] as const) {
-		it(`exact acceptance survives actual SDK split-turn compaction: ${host}/${systemPromptMode}/${structured ? "structured" : "fenced"}`, { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated 0.85.1 SDK root" }, async () => {
+		it(`exact acceptance survives actual SDK split-turn compaction: ${host}/${systemPromptMode}/${structured ? "structured" : "fenced"}`, { skip: !sdkRoot && "Set PI_SUBAGENTS_NATIVE_SDK to the isolated 0.86.1 SDK root" }, async () => {
 			const entry = execFileSync(process.execPath, ["--input-type=module", "-e", "console.log(import.meta.resolve('@earendil-works/pi-coding-agent'))"], { cwd: sdkRoot, encoding: "utf8" }).trim();
 			const pi: PiCodingAgentModule = await import(entry);
-			assert.equal(pi.VERSION, "0.85.1");
+			assert.equal(pi.VERSION, "0.86.1");
 			const cwd = mkdtempSync(join(tmpdir(), "acceptance-compaction-"));
 			const agentDir = join(cwd, "agent"); mkdirSync(agentDir);
 			const oldDir = process.env.PI_CODING_AGENT_DIR;
@@ -86,7 +86,7 @@ for (const host of ["foreground", "runner"] as const) {
 			try {
 				const result = host === "foreground"
 					? await runSync(cwd, [agent], agent.name, task, { acceptance: explicit, structuredOutput, waitToolEnabled: false, childSessionFactory: observedFactory })
-					: await runSingleStepInner({ ...agent, agent: agent.name, task, context: "fresh", effectiveAcceptance: acceptance, structuredOutput, modelCandidates: [agent.model!], waitToolEnabled: false }, { cwd, id: "compact-runner", flatIndex: 0, flatStepCount: 1, previousOutput: "", placeholder: "{previous}", outputFile: join(cwd, "output.log"), sessionEnabled: false, childSessions: observedFactory });
+					: await runSingleStepInner({ ...agent, agent: agent.name, task, context: "fresh", effectiveAcceptance: acceptance, structuredOutput, waitToolEnabled: false }, { cwd, id: "compact-runner", flatIndex: 0, flatStepCount: 1, previousOutput: "", placeholder: "{previous}", outputFile: join(cwd, "output.log"), sessionEnabled: false, childSessions: observedFactory });
 				assert.equal(result.exitCode, 0, `${result.error}; ${JSON.stringify(events.filter((e) => e.type.includes("compact") || (e.type === "message_end" && e.message.role === "assistant" && e.message.stopReason === "error")))}`);
 				assert.equal(result.acceptance?.status, "checked");
 				if (structured) assert.deepEqual(result.structuredOutput, { ok: true });

@@ -99,13 +99,13 @@ interface ResultChildOutcome {
 	sessionFile?: string;
 	model?: string;
 	thinking?: string;
-	attemptedModels?: string[];
-	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
+	requestedModel?: string;
 	contextOverflow?: boolean;
 }
 
 interface ResultRepairData {
 	state: "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
+	error?: string;
 	results?: ResultChildOutcome[];
 }
 
@@ -120,7 +120,8 @@ function regularFileExists(filePath: string): boolean {
 
 function readResultRepairData(resultPath: string): ResultRepairData | undefined {
 	try {
-		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; results?: unknown };
+		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; error?: unknown; results?: unknown };
+		if (data.error !== undefined && typeof data.error !== "string") throw new Error(`Invalid async result file '${resultPath}': error must be a string.`);
 		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "partial" ? "partial" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 		const results = Array.isArray(data.results)
 			? data.results.map((entry, index) => {
@@ -131,7 +132,7 @@ function readResultRepairData(resultPath: string): ResultRepairData | undefined 
 				return child;
 			})
 			: undefined;
-		return { state, ...(results ? { results } : {}) };
+		return { state, ...(data.error ? { error: data.error } : {}), ...(results ? { results } : {}) };
 	} catch (error) {
 		if (isNotFoundError(error)) return undefined;
 		throw new Error(`Failed to read async result file '${resultPath}': ${getErrorMessage(error)}`, {
@@ -146,9 +147,16 @@ function childState(overallState: ResultRepairData["state"], child: ResultChildO
 	return overallState;
 }
 
+function failureDiagnostic(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value : undefined;
+}
+
 function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: number): AsyncStatus | undefined {
 	const repair = readResultRepairData(resultPath);
 	if (!repair) return undefined;
+	const rootError = failureDiagnostic(status.error)
+		?? failureDiagnostic(repair.error)
+		?? repair.results?.map((child) => child.success === false ? failureDiagnostic(child.error) : undefined).find(Boolean);
 	const steps = (status.steps ?? []).map((step, index) => {
 		if (step.status !== "running" && step.status !== "pending") return step;
 		const child = repair.results?.[index];
@@ -167,14 +175,14 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			sessionFile: step.sessionFile ?? child?.sessionFile,
 			model,
 			thinking,
-			attemptedModels: child?.attemptedModels ?? step.attemptedModels,
-			modelAttempts: child?.modelAttempts ?? step.modelAttempts,
+			requestedModel: child?.requestedModel ?? step.requestedModel,
 			contextOverflow: child?.contextOverflow ?? step.contextOverflow,
 		};
 	});
 	const terminalStatus: AsyncStatus = {
 		...status,
 		state: repair.state,
+		...(rootError && (repair.state === "failed" || repair.state === "partial") ? { error: rootError } : {}),
 		...(status.lifecycleArtifactVersion === 3 && (!status.processTerminal || status.processTerminal.state === "pending") ? {
 			processTerminal: { version: 1 as const, state: "unknown" as const, runId: status.runId, runnerProcessInstanceId: "observer-unavailable", reason: "observer-unavailable" as const },
 		} : {}),
@@ -264,8 +272,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 				error: step.status === "complete" || step.status === "completed" ? undefined : step.error ?? message,
 				success: step.status === "complete" || step.status === "completed",
 				model: step.model,
-				attemptedModels: step.attemptedModels,
-				modelAttempts: step.modelAttempts,
+				requestedModel: step.requestedModel,
 				contextOverflow: step.contextOverflow,
 				sessionFile: step.sessionFile,
 			})),
@@ -378,9 +385,26 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			? terminalStatusFromResult(effectiveStatus, existingResultPath, now)
 			: undefined;
 		if (terminalStatus) {
-			writeAtomicJson(path.join(asyncDir, "status.json"), terminalStatus);
-			updateActiveRunIndex(asyncDir, terminalStatus.state, terminalStatus.toolCallId);
-			return { status: terminalStatus, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };
+			const currentStatus = readStatus(asyncDir);
+			const currentRootError = failureDiagnostic(currentStatus?.error);
+			const currentTerminal = currentStatus?.processTerminal?.state === "observed" || currentStatus?.processTerminal?.state === "unknown"
+				? currentStatus.processTerminal
+				: undefined;
+			const steps = terminalStatus.steps?.map((step, index) => {
+				const currentStepTerminal = currentStatus?.steps?.[index]?.processTerminal;
+				return currentStepTerminal?.state === "observed" || currentStepTerminal?.state === "unknown"
+					? { ...step, processTerminal: currentStepTerminal }
+					: step;
+			});
+			const statusToWrite: AsyncStatus = {
+				...terminalStatus,
+				...(currentRootError ? { error: currentRootError } : {}),
+				...(currentTerminal ? { processTerminal: currentTerminal } : {}),
+				...(steps ? { steps } : {}),
+			};
+			writeAtomicJson(statusPath, statusToWrite);
+			updateActiveRunIndex(asyncDir, statusToWrite.state, statusToWrite.toolCallId);
+			return { status: statusToWrite, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };
 		}
 		if (effectiveStatus.displayDismissedAt === undefined) return { status: effectiveStatus, repaired: false, resultPath: existingResultPath };
 	}
