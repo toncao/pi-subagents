@@ -5,6 +5,7 @@
  * structured output capture, disposal, and detach.
  */
 
+import { execFileSync } from "node:child_process";
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -15,9 +16,13 @@ import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, remov
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-launch.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import type { ForegroundChildSessionControls, PlacementMachineReference, SingleResult } from "../../src/shared/types.ts";
+import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
+import { SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../../src/runs/shared/model-resolution.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -233,6 +238,282 @@ describe("in-process foreground child", () => {
 		assert.equal(result.finalOutput, "finished");
 		assert.equal(mockPi.sessions[0]?.settled, true);
 		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("skips an unregistered configured primary without inventing a model attempt", async () => {
+		mockPi.onCall({ output: "registered fallback completed" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "openai/placeholder",
+			fallbackModels: ["missing/also", "devin/swe-2:high", "devin/swe-2:low"],
+		})], "worker", "Perform once", {
+			runId: "unregistered-primary-fallback",
+			sessionFile: path.join(tempDir, "new-child.jsonl"),
+			forkSanitized: true,
+			availableModels: [{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2", api: "openai-completions" }],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.requestedModel, "openai/placeholder");
+		assert.equal(mockPi.sessions.length, 1);
+		assert.equal(mockPi.sessions[0]?.launch.model, "devin/devin/swe-2:high");
+		assert.equal(mockPi.sessions[0]?.task, "Task: Perform once");
+		assert.ok(!result.attemptedModels?.includes("openai/placeholder"));
+	});
+
+	it("does not replace an unregistered model for an existing child session", async () => {
+		const sessionFile = path.join(tempDir, "retained-session.jsonl");
+		fs.writeFileSync(sessionFile, "");
+		await assert.rejects(runSync(tempDir, [makeAgent("worker", {
+			model: "openai/placeholder", fallbackModels: ["devin/swe-2"],
+		})], "worker", "Continue", {
+			runId: "retained-unregistered-primary", sessionFile,
+			availableModels: [{ provider: "devin", id: "swe-2", fullId: "devin/swe-2" }],
+		}), /Unknown subagent model/);
+		assert.equal(mockPi.sessions.length, 0);
+	});
+
+	it("falls back to a different model after a zero-progress HTTP 401", async () => {
+		const primary = "openai/placeholder";
+		const fallback = "devin/swe-2";
+		const finalFallback = "anthropic/claude-sonnet-4";
+		const error = "OpenAI API error (401): invalid_api_key";
+		const fallbackError = "Provider error (503): temporarily unavailable";
+		mockPi.onCall({ jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				model: "placeholder",
+				stopReason: "error",
+				errorMessage: error,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		}] });
+		mockPi.onCall({ jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				model: "swe-2",
+				stopReason: "error",
+				errorMessage: fallbackError,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		}] });
+		mockPi.onCall({ output: "fallback completed" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: primary,
+			fallbackModels: [fallback, finalFallback],
+		})], "worker", "Perform once", {
+			runId: "zero-progress-401-fallback",
+			availableModels: [
+				{ provider: "openai", id: "placeholder", fullId: primary },
+				{ provider: "devin", id: "swe-2", fullId: fallback },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: finalFallback },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.finalOutput, "fallback completed");
+		assert.equal(mockPi.sessions.length, 3);
+		assert.deepEqual(mockPi.sessions.map((session) => session.launch.model), [primary, fallback, finalFallback]);
+		assert.deepEqual(mockPi.sessions.map((session) => session.task), ["Task: Perform once", "Task: Perform once", "Task: Perform once"]);
+		assert.deepEqual(result.attemptedModels, [primary, fallback, finalFallback]);
+		assert.deepEqual(result.modelAttempts?.map(({ model, success, error: attemptError }) => ({ model, success, error: attemptError })), [
+			{ model: primary, success: false, error },
+			{ model: fallback, success: false, error: fallbackError },
+			{ model: finalFallback, success: true, error: undefined },
+		]);
+	});
+
+	it("does not replay a different model after any useful assistant output", async () => {
+		const error = "OpenAI API error (401): invalid_api_key";
+		mockPi.onCall({ jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "partial output" }],
+				model: "gpt-5-mini",
+				stopReason: "error",
+				errorMessage: error,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		}] });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})], "worker", "Do not replay", {
+			runId: "useful-output-no-fallback",
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.error, error);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(result.attemptedModels, ["openai/gpt-5-mini"]);
+	});
+
+	it("does not retry after the first zero-progress attempt exhausts the usage budget", async () => {
+		const error = "OpenAI API error (401): invalid_api_key";
+		mockPi.onCall({ jsonl: [{ type: "message_end", message: {
+			role: "assistant",
+			content: [],
+			model: "openai/gpt-5-mini",
+			stopReason: "error",
+			errorMessage: error,
+			usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+		} }] });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})], "worker", "Respect budget", {
+			runId: "usage-budget-no-fallback",
+			usageBudget: { tokens: { hard: 5 } },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(mockPi.sessions.length, 1);
+	});
+
+	it("does not retry a zero-output failure when mutation evidence changed", async () => {
+		execFileSync("git", ["init", "-q", tempDir]);
+		const changed = path.join(tempDir, "provider-side-effect.txt");
+		fs.writeFileSync(changed, "before");
+		execFileSync("git", ["-C", tempDir, "add", "provider-side-effect.txt"]);
+		execFileSync("git", ["-C", tempDir, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"]);
+		const error = "Provider error (503): temporarily unavailable";
+		mockPi.onCall({
+			writeFiles: [{ path: changed, content: "changed" }],
+			jsonl: [{ type: "message_end", message: {
+				role: "assistant",
+				content: [],
+				model: "openai/gpt-5-mini",
+				stopReason: "error",
+				errorMessage: error,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			} }],
+		});
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "openai/gpt-5-mini",
+			fallbackModels: ["anthropic/claude-sonnet-4"],
+		})], "worker", "Do not replay mutations", {
+			runId: "mutation-evidence-no-fallback",
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.equal(fs.readFileSync(changed, "utf8"), "changed");
+	});
+
+	it("does not start a different-model fallback after a completed tool", async () => {
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-before-limit", name: "read", arguments: { path: "state.txt" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-before-limit", toolName: "read", args: { path: "state.txt" } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "read-before-limit", toolName: "read", isError: false, content: [{ type: "text", text: "state" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-before-limit", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+		] });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "anthropic/claude-sonnet-4",
+			fallbackModels: ["openai/gpt-5-mini"],
+		})], "worker", "Read once", {
+			runId: "post-tool-no-cross-model-replay",
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+			],
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(result.attemptedModels, ["anthropic/claude-sonnet-4"]);
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, []);
+	});
+
+	it("continues a live session across an exact-model account limit without replaying a completed mutation", async () => {
+		const target = path.join(tempDir, "mutated-once.txt");
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+		mockPi.onCall({
+			writeFiles: [{ path: target, content: "once" }],
+			jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "write-1", name: "write", arguments: { path: target, content: "once" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+				{ type: "tool_execution_start", toolCallId: "write-1", toolName: "write", args: { path: target, content: "once" } },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "write-1", toolName: "write", isError: false, content: [{ type: "text", text: "wrote once" }] } },
+				{ type: "tool_execution_end", toolCallId: "write-1", toolName: "write" },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+			],
+		});
+		mockPi.onCall({ output: "continued from the prior tool result" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "anthropic/claude-sonnet-4",
+			fallbackModels: ["anthropic-2/claude-sonnet-4", "openai/gpt-5-mini"],
+		})], "worker", "Write exactly once", {
+			runId: "same-session-account-continuation",
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(fs.readFileSync(target, "utf8"), "once");
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, ["anthropic-2/claude-sonnet-4"]);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(result.progressSummary?.toolCount, 1);
+		assert.deepEqual(result.attemptedModels, ["anthropic/claude-sonnet-4", "anthropic-2/claude-sonnet-4"]);
+		assert.deepEqual(result.modelAttempts?.map(({ model, success }) => ({ model, success })), [
+			{ model: "anthropic/claude-sonnet-4", success: false },
+			{ model: "anthropic-2/claude-sonnet-4", success: true },
+		]);
+	});
+
+	it("uses the same no-replay continuation seam in the detached child driver", async () => {
+		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "state.txt" } }], model: "openai-codex/gpt-5.4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "state.txt" } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false, content: [{ type: "text", text: "prior result" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-1", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "openai-codex/gpt-5.4", stopReason: "error", errorMessage: "quota exhausted", usage } },
+		] });
+		mockPi.onCall({ output: "continued asynchronously" });
+		const launch = buildInProcessChildLaunch({
+			sessionEnabled: false,
+			model: "openai-codex/gpt-5.4",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			cwd: tempDir,
+			childAgentName: "worker",
+			childIndex: 0,
+			host: "runner",
+		});
+		const result = await runChildSession({
+			factory: childSessionFactory(),
+			launch,
+			prompt: "Task: inspect state once",
+			appendChildEvent: () => {},
+			writeOutputLine: () => {},
+			expectedModelForVerification: "openai-codex/gpt-5.4",
+			accountFallbackCandidates: ["openai-codex-2/gpt-5.4"],
+			modelVerificationRegistry: [
+				{ provider: "openai-codex", id: "gpt-5.4", fullId: "openai-codex/gpt-5.4" },
+				{ provider: "openai-codex-2", id: "gpt-5.4", fullId: "openai-codex-2/gpt-5.4" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.toolCount, 1);
+		assert.deepEqual(result.sameSessionAccountFallback?.attemptedCandidates, ["openai-codex/gpt-5.4", "openai-codex-2/gpt-5.4"]);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+		assert.equal(result.messages.some((message) => message.role === "toolResult" && (message as { toolCallId?: string }).toolCallId === "read-1"), true);
 	});
 
 	it("reports the run only after the child session's shutdown work finished", async () => {

@@ -106,6 +106,7 @@ export class HerdrPiSession<C extends PlacementSockets = PlacementSockets> imple
 	subscribe(listener: (event: ChildSessionEvent) => void) { this.#listeners.add(listener); return () => this.#listeners.delete(listener); }
 	prompt(text: string) { return this.#operation("prompt", text); } steer(text: string) { return this.#operation("steer", text); } followUp(text: string) { return this.#operation("follow-up", text); } async abort() { this.#aborted = true; await this.#operation("abort"); }
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#replyTimer) clearInterval(this.#replyTimer); this.bridge.close(); await this.bridgeForward.close(); await this.owner.cleanup(this.#aborted); }
+	async switchModel(_model: string): Promise<void> { throw new Error("Pane-native sessions do not support live account-alias model switching."); }
 	get messages() { return this.#messages; } get sessionFile() { return undefined; } get sessionId() { return this.identity.nativeSessionId; } get modelId() { return this.model; }
 	get machineEvidence() { return { provider: this.owner.machine.provider, machineId: this.identity.machineId, ...(this.#initialGit ? { initial: this.#initialGit } : {}), ...(this.#finalGit ? { final: this.#finalGit } : {}) }; }
 	get placementSnapshot() { return this.owner.snapshot; }

@@ -11,6 +11,7 @@ import type { WorkflowReceipt } from "../../src/workflows/workflow-receipt.ts";
 import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { SAME_SESSION_ACCOUNT_FALLBACK_NOTICE } from "../../src/runs/shared/model-resolution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
 import { primeBootId, resetBootIdForTesting } from "../../src/runs/background/boot-id.ts";
 import {
@@ -493,6 +494,163 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, true);
 		assert.equal(payload.results[0]?.thinking, "high");
 		assert.equal(status.steps?.[0]?.thinking, "high");
+	});
+
+	it("launches the registered fallback and retains the remaining async retry chain", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const fallback = "devin/devin/swe-2:high";
+		const finalFallback = "anthropic/claude-sonnet-4";
+		const error = "Provider error (503): temporarily unavailable";
+		mockPi.onCall({ jsonl: [{ type: "message_end", message: {
+			role: "assistant", content: [], model: "swe-2", stopReason: "error", errorMessage: error,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+		} }] });
+		mockPi.onCall({ output: "registered async fallback completed" });
+		const id = `async-unregistered-primary-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker", task: "Perform once",
+			agentConfig: makeAgent("worker", { model: "openai/placeholder", fallbackModels: ["missing/also", "devin/swe-2:high", "devin/swe-2:low", finalFallback] }),
+			availableModels: [
+				{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: finalFallback },
+			],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-unregistered-primary" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.output, "registered async fallback completed");
+		assert.deepEqual(payload.results[0]?.attemptedModels, [fallback, finalFallback]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map(attempt => attempt.success), [false, true]);
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8"));
+		assert.equal(status.steps[0].requestedModel, "openai/placeholder");
+	});
+
+	it("uses the configured fallback in async chains before binding the launch", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "chain fallback completed" });
+		const id = `async-chain-unregistered-primary-${Date.now().toString(36)}`;
+		const launch = executeAsyncChain(id, {
+			chain: [{ agent: "worker", task: "Perform once" }],
+			agents: [makeAgent("worker", { model: "openai/placeholder", fallbackModels: ["devin/swe-2:high"] })],
+			availableModels: [{ provider: "devin", id: "devin/swe-2", fullId: "devin/devin/swe-2", contextWindow: 12345 }],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-chain-unregistered" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.output, "chain fallback completed");
+		assert.equal(mockPi.callCount(), 1);
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8"));
+		// Upstream status keeps the live observed model; requested thinking is separate.
+		assert.equal(status.steps[0].model, "devin/devin/swe-2");
+		assert.equal(status.steps[0].thinking, "high");
+		assert.equal(status.steps[0].requestedModel, "openai/placeholder");
+		assert.equal(status.steps[0].contextLimit, 12345);
+	});
+
+	it("does not replace an unavailable model for an existing async session", () => {
+		const sessionFile = path.join(tempDir, "retained-session.jsonl");
+		fs.writeFileSync(sessionFile, "");
+		const launch = executeAsyncSingle(`async-retained-unregistered-${Date.now().toString(36)}`, {
+			agent: "worker", task: "Continue", sessionFile,
+			agentConfig: makeAgent("worker", { model: "openai/placeholder", fallbackModels: ["devin/swe-2"] }),
+			availableModels: [{ provider: "devin", id: "swe-2", fullId: "devin/swe-2" }],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-retained" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, maxSubagentDepth: 2, acceptance: false,
+		});
+		assert.equal(launch.isError, true);
+		assert.match(launch.content[0]?.text ?? "", /Unknown subagent model/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("retries an async child on a different model after a zero-progress HTTP 401", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const primary = "openai/placeholder";
+		const fallback = "devin/swe-2";
+		const error = "OpenAI API error (401): invalid_api_key";
+		mockPi.onCall({ jsonl: [{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				model: "placeholder",
+				stopReason: "error",
+				errorMessage: error,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		}] });
+		mockPi.onCall({ output: "async fallback completed" });
+		const id = `async-zero-progress-fallback-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Perform once",
+			agentConfig: makeAgent("worker", { model: primary, fallbackModels: [fallback] }),
+			availableModels: [
+				{ provider: "openai", id: "placeholder", fullId: primary },
+				{ provider: "devin", id: "swe-2", fullId: fallback },
+			],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-zero-progress-fallback" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.output, "async fallback completed");
+		assert.deepEqual(payload.results[0]?.attemptedModels, [primary, fallback]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map(({ model, success, error: attemptError }) => ({ model, success, error: attemptError })), [
+			{ model: primary, success: false, error },
+			{ model: fallback, success: true, error: undefined },
+		]);
+		const calls = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { sessionId?: string; args?: string[] });
+		assert.equal(new Set(calls.map((call) => call.sessionId)).size, 2);
+		assert.deepEqual(calls.map((call) => call.args?.find((arg) => arg === primary || arg === fallback)), [primary, fallback]);
+	});
+
+	it("continues an inherited-model async session on an exact account alias without replay", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const target = path.join(tempDir, `async-same-session-${Date.now().toString(36)}.txt`);
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } };
+		mockPi.onCall({
+			writeFiles: [{ path: target, content: "once" }],
+			jsonl: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "write-async-1", name: "write", arguments: { path: target, content: "once" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+				{ type: "tool_execution_start", toolCallId: "write-async-1", toolName: "write", args: { path: target, content: "once" } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "write-async-1", toolName: "write", isError: false, content: [{ type: "text", text: "wrote once" }] } },
+				{ type: "tool_execution_end", toolCallId: "write-async-1", toolName: "write" },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit exceeded", usage } },
+			],
+		});
+		mockPi.onCall({ output: "continued from the retained tool result" });
+		const id = `async-same-session-account-${Date.now().toString(36)}`;
+		const launch = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Write once, then finish",
+			agentConfig: makeAgent("worker", { fallbackModels: ["anthropic-2/claude-sonnet-4:high"] }),
+			thinkingOverride: "low",
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+			],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1", currentModelProvider: "anthropic", currentModel: { provider: "anthropic", id: "claude-sonnet-4" } },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(fs.readFileSync(target, "utf-8"), "once");
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["anthropic/claude-sonnet-4:low", "anthropic-2/claude-sonnet-4:low"]);
+		assert.deepEqual(payload.results[0]?.modelAttempts?.map((attempt) => attempt.success), [false, true]);
+		const calls = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-")).map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { sessionId?: string; args?: string[] });
+		assert.equal(new Set(calls.map((call) => call.sessionId)).size, 1);
+		assert.equal(calls.some((call) => call.args?.at(-1) === SAME_SESSION_ACCOUNT_FALLBACK_NOTICE), true);
 	});
 
 	it("persists the bounded usage projection in async results and metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
