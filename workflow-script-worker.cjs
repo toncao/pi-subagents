@@ -832,7 +832,30 @@ function launchRunsAllPermissive(items) {
   return { calls, launched: launched.map((entry, index) => entry ?? runHostCall(calls[index].key, calls[index].params, false, undefined)) };
 }
 
+function runSlice(spec) {
+  assertJsonValue(spec, "runs.slice contract");
+  let tracked;
+  const observe = (items) => trackRunObservation(items, tracked);
+  const started = hostCall("slice.begin", { spec }, { key: spec.key, operation: "slice" });
+  const chain = started.then((receipt) => {
+    const writer = receipt.spec.writer;
+    const params = writer ? { ...writer, context: "fresh", worktree: false, task: receipt.writerTask, outputSchema: receipt.writerSchema, acceptance: { level: "none", reason: "Persisted slice uses its own exact-revision review; no executable verification." }, extensionBindings: { "pi-subagents.source-slice/1": { paths: receipt.spec.paths } }, output: "slices/" + receipt.attempt + "/writer.json" } : undefined;
+    const result = params ? runCollected(spec.key + ".writer", params, observe) : Promise.resolve();
+    return result.then(() => hostCall("slice.seal", { attempt: receipt.attempt }));
+  }).then((receipt) => {
+    if (receipt.state !== "review-required") return receipt;
+    const params = { ...receipt.spec.reviewer, context: "fresh", worktree: false, task: receipt.reviewTask, outputSchema: receipt.reviewSchema, acceptance: { level: "none", reason: "Read-only exact-revision slice review." }, extensionBindings: { "pi-subagents.source-slice/1": { paths: [] } }, output: "slices/" + receipt.attempt + "/review.json" };
+    return runCollected(spec.key + ".review", params, observe).then(() => hostCall("slice.reviewed", { attempt: receipt.attempt }));
+  });
+  tracked = trackObservationTracker({ observations: [], consumed: false, dependencies: [promiseObservationTracker(started)] }, chain, true);
+  return tracked;
+}
+
 const runs = Object.freeze({
+  slice(spec) { return runSlice(spec); },
+  acceptSlice(attempt, revision, reason) {
+    return hostCall("slice.accept", { attempt, revision, reason }, { key: attempt, operation: "slice" });
+  },
   run(key, params) {
     if (key && typeof key === "object" && !Array.isArray(key)) throw new Error('runs.run expects (key, params); got an object as the first argument. Use runs.run("plan", { agent, task }) or runs.all([{ key, agent, task }]).');
     validateRunCall(key, params, "runs.run", runFingerprints);

@@ -60,6 +60,18 @@ describe("child runtime config", () => {
 		}
 	});
 
+	it("installs source-only enforcement as a native hook including empty reviewer inventories", async () => {
+		const hooks = createChildHooks(baseConfig({ sourceSlicePaths: [] }));
+		const hook = hooks.find((entry) => entry.name === "pi-subagents:source-slice");
+		assert.ok(hook);
+		const pi = fakePi([]);
+		hook.factory(pi.api as never);
+		const call = pi.handlers.get("tool_call")![0]!;
+		assert.deepEqual(await call({ toolName: "read", input: { path: "/tmp/source.ts" } }, { cwd: "/tmp" }), undefined);
+		assert.equal((await call({ toolName: "write", input: { path: "/tmp/source.ts" } }, { cwd: "/tmp" }) as { block: boolean }).block, true);
+		assert.equal((await call({ toolName: "bash", input: { command: "python -c 'compile(\"pass\",\"\",\"exec\")'" } }, { cwd: "/tmp" }) as { block: boolean }).block, true);
+	});
+
 	it("hooks read the config object", async () => {
 		const diagnostics: unknown[] = [];
 		const captured: unknown[] = [];

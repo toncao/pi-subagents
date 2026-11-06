@@ -9,6 +9,7 @@ import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { ChildHookExtension, ChildSessionLaunch } from "./child-session.ts";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { projectRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
+import { registerSourceSlicePolicy } from "./source-slice-policy.ts";
 
 type OwnedCapture = Required<Pick<ChildRuntimeConfig, "toolDiagnostic" | "runtimeAcknowledgements">>;
 type PromptProof = { config: ChildRuntimeConfig; snapshot: string; factories?: ChildHookExtension["factory"][]; observeNext?: ReadonlyDrainObservation; observation?: ReadonlyDrainObservation; capture?: OwnedCapture; reporting?: { launch: ChildSessionLaunch; callback: ChildSessionLaunch["onExtensionError"] } };
@@ -164,6 +165,7 @@ function childHooks(config: ChildRuntimeConfig, capture?: OwnedCapture, holdFina
 			if (runtime.structuredOutput) return structuredOutputValidatorReady();
 		} },
 	];
+	if (config.sourceSlicePaths) hooks.push({ name: "pi-subagents:source-slice", factory: (pi) => registerSourceSlicePolicy(pi, config.sourceSlicePaths!) });
 	if (config.fast) hooks.push({ name: "pi-subagents:fast-mode", factory: (pi) => registerSubagentFastModeExtension(pi) });
 	if (config.fanoutChild) hooks.push({ name: "pi-subagents:fanout-child", factory: (pi) => registerFanoutChildSubagentExtension(pi, runtime) });
 	hooks.push({ name: "pi-subagents:prompt-boundary", factory: (pi) => registerSubagentPromptBoundary(pi, runtime) });
