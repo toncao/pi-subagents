@@ -47,6 +47,12 @@ describe("registered subagent tool description", () => {
 			assert.ok(description.includes(authorityGate));
 		}
 
+		for (const mode of [undefined, "full", "compact", "custom"] as const) {
+			const text = buildSubagentToolDescription({ toolDescriptionMode: mode }, { cwd, agentDir });
+			assert.equal(text.match(/Self-contained child briefs/g)?.length, 1);
+			assert.match(text, /no shared conversation/);
+		}
+
 		const fallbackCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-authority-fallback-"));
 		assert.ok(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd: fallbackCwd, agentDir, warn() {} }).includes(authorityGate));
 		assert.match(buildSubagentToolDescription({ toolDescriptionMode: "custom" }, { cwd, agentDir }), /Operator-owned custom guidance/);
@@ -54,11 +60,7 @@ describe("registered subagent tool description", () => {
 
 	it("uses a one-line snippet only by default", () => {
 		assert.equal(buildSubagentToolDescription(), DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
-		for (const mode of [undefined, "full", "compact", "custom"] as const) {
-			const text = buildSubagentToolDescription({ toolDescriptionMode: mode }, { cwd, agentDir });
-			assert.equal(text.match(/Self-contained child briefs/g)?.length, 1);
-			assert.match(text, /no shared conversation/);
-		}
+
 		assert.deepEqual(buildSubagentToolPromptMetadata(), { promptSnippet: SUBAGENT_TOOL_PROMPT_SNIPPET });
 		assert.ok(!SUBAGENT_TOOL_PROMPT_SNIPPET.includes("\n"));
 		for (const toolDescriptionMode of ["full", "compact", "custom"] as const) {
