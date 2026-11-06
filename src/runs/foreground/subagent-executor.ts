@@ -6455,7 +6455,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							launch: async (key, childParams, workflowSignal, admission) => {
 								if (admission.sliceRole) {
 									const agent = resolveAgentName(String(childParams.agent), discoverWorkflowAgents(workflowCwd, resolveExecutionAgentScope(workflowChildDefaults.agentScope)).agents).agent;
-									if (!agent || agent.runner) throw new Error("Persisted slices require native Pi agents; no alternate runner fallback.");
+									if (!agent || agent.runner || agent.launcher) throw new Error(`Implementation slice agent '${String(childParams.agent)}' requires a native Pi child with no alternate runner/launcher; no fallback is allowed.`);
 								}
 								const journalFingerprint = workflowJournalFingerprints.get(key) ?? workflowChildFingerprint(childParams);
 								workflowJournalFingerprints.set(key, journalFingerprint);
@@ -6778,7 +6778,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					launch: async (key, childParams, workflowSignal, admission) => {
 						if (admission.sliceRole) {
 							const agent = resolveAgentName(String(childParams.agent), discoverWorkflowAgents(workflowCwd, resolveExecutionAgentScope(workflowChildDefaults.agentScope)).agents).agent;
-							if (!agent || agent.runner) throw new Error("Persisted slices require native Pi agents; no alternate runner fallback.");
+							if (!agent || agent.runner || agent.launcher) throw new Error(`Implementation slice agent '${String(childParams.agent)}' requires a native Pi child with no alternate runner/launcher; no fallback is allowed.`);
 						}
 						if (delegatedWorkflowPermit && admission.batch) throw new Error("Workflow child permit does not support runs.all.");
 						if (delegatedWorkflowPermit && childParams.resume !== undefined) throw new Error("Workflow child permit does not support retained resume.");
