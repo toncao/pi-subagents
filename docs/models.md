@@ -15,7 +15,11 @@ Precedence, strongest first: per-run override → provider-scoped role override 
 
 On the two Claude Code adapters a model is Claude Code's own alias or id rather than a Pi child model, so a value set for one of them resolves nothing against the registry. `subagents.defaultModel` is ignored there, because it is a default for Pi children. An explicit `agentOverrides.<name>.model` or agent frontmatter `model` is passed on as given, and Claude Code reports it when it does not recognize the value. See [agents](agents.md).
 
-Each launch resolves one model. Provider errors, including HTTP 429 responses, are returned from that model rather than selecting another one. Separately, a verified compaction abort after useful progress may continue the retained child session once on the same resolved model; this lifecycle recovery preserves work and is not model fallback.
+Each launch resolves one primary model. This fork also accepts an ordered `fallbackModels` list on agent frontmatter, runtime definitions, profiles, and `subagents.agentOverrides.<name>`. Before the child produces useful assistant output or any tool history, a terminal provider/model failure may retry the original task once per ordered candidate in a new child attempt; this includes authentication failures such as HTTP 401. Each attempt shares the logical deadline and is recorded in `attemptedModels` and `modelAttempts`. After any useful output or tool activity, different-model/provider replay is forbidden: only guarded same-session continuation to an account alias for the exact same model remains eligible. Separately, a verified compaction abort after useful progress may continue the retained child session once on the already resolved model.
+
+For a fresh launch, if the **configured** primary is absent from a non-empty active registry, selection now checks the existing `fallbackModels` list before starting a child. Unknown fallbacks are skipped in order; the first resolvable candidate is selected, with normal provider qualification, thinking and scope checks. Remaining distinct candidates stay available for zero-progress runtime failures. For example, a configured `model: "openai/placeholder"` can select the first registered entry in its fallback list without making an API request to the missing primary.
+
+This is not a runtime retry: the selection warning identifies the missing primary and selected fallback, `requestedModel` retains the original request, and `attemptedModels`/`modelAttempts` describe only actual child attempts. Explicit per-run unknown model pins still fail, inherited parent models remain inherited, scope violations remain errors under their existing enforcement rules, and a missing/empty registry is not treated as proof of model absence. Existing child/fork sessions are not switched by this registry-selection path. No usable fallback means the original unknown-model error. Configuration and auth are never rewritten by this behavior.
 
 Use `model: "inherit"` in agent frontmatter or `agentOverrides.<name>.model` to select the current parent session model explicitly.
 
@@ -31,7 +35,8 @@ In `~/.pi/agent/settings.json` (user) or the project config settings file (`.pi/
     "defaultProvider": "gpu-a",
     "agentOverrides": {
       "oracle": {
-        "model": "deepseek-v4-pro"
+        "model": "anthropic/claude-fable-5",
+        "fallbackModels": ["anthropic-2/claude-fable-5"]
       },
       "worker": {
         "defaultProvider": "gpu-b"
@@ -84,7 +89,7 @@ For a persistent role override:
 }
 ```
 
-`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, project, and runtime-registered agents. `defaultModel` fills only agents that do not set `model` in frontmatter or in their runtime definition. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` win over frontmatter and the global default. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable an agent (see [agents.md](agents.md)); matching custom-agent frontmatter is replaced for any field set by the override. Runtime-registered agents take only `model`, `defaultProvider`, `fast`, and `thinking` from `agentOverrides.<name>`; their other definition fields stay owned by the registering extension.
+`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, project, and runtime-registered agents. `defaultModel` fills only agents that do not set `model` in frontmatter or in their runtime definition. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` win over frontmatter and the global default. The same `agentOverrides` block can change `fallbackModels`, `tools`, `skills`, inherited context, prompt text, or disable an agent (see [agents.md](agents.md)); matching custom-agent frontmatter is replaced for any field set by the override. Runtime-registered agents take `model`, `defaultProvider`, `fallbackModels`, `fast`, and `thinking` from `agentOverrides.<name>`; their other definition fields stay owned by the registering extension.
 
 ## Fast mode
 
@@ -103,7 +108,9 @@ A setup that works well in practice: route agents by task shape instead of runni
 
 The routing rule: use the capability tiers (1–3) when the task is well-scoped, and the intent tier (4) when scoping or judging is the task itself.
 
-Each launch resolves one model and starts the child once. Provider, authentication, quota, rate-limit, stream, empty-response, context-overflow, and provisioning failures are returned from that attempt. To try another model, the parent or operator must issue a later explicit launch.
+Each launch resolves one primary model. If that child fails with a provider/model error before producing useful assistant output, starting a tool, reporting a tool result, accepting follow-up input, recording a mutation attempt, or consuming a cancellation/budget/structured-output boundary, the next configured fallback may start as a new child attempt with the original task. Terminal provider errors are trusted for this decision; launch-time failures without a terminal provider message must match a bounded authentication, availability, network, empty-response, or model-verification class. Context overflow remains terminal because retrying the same input does not prove another candidate can accept it. Each candidate is selected for zero-progress fallback at most once, all attempts share the original logical deadline, and results preserve the ordered attempts and usage. Verified same-model compaction continuation remains a separate one-time recovery path.
+
+After a child has produced useful output or completed tools, runtime recovery is deliberately narrower: it can continue only in that same live child session, only to a configured account alias for the exact same model, and only when the tool-call history is fully paired and successful. Cancellation, an active tool, exhausted run/tool budgets, structured output, failed/incomplete tool history, a different model, a different provider family (for example `openai` to `azure-openai-responses`), or an untrusted/non-terminal error disables continuation. The child receives a short continuation notice over its retained transcript and tool results; the original `Task:` is not replayed. Results expose `attemptedModels` and per-attempt terminal accounting for both zero-progress retry and same-session continuation. Remote Herdr sessions currently fail closed for post-progress account continuation because their bridge does not implement live model switching.
 
 ## Thinking level defaults
 
@@ -186,7 +193,7 @@ You do not have to spell a model exactly. Model ids are matched fuzzily against 
 
 Exact `provider/id` matches still win, and a qualified provider query never silently switches providers — it only matches within the named provider. Ambiguous bare ids that exist under multiple providers still require a provider prefix or the current session's provider to disambiguate.
 
-Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that matches a registered provider still means `provider/id`.
+Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that matches a registered provider restricts resolution to that provider. An exact catalog id within that provider also matches: provider `devin` with id `devin/swe-2` accepts `devin/swe-2:high` and resolves to the canonical `devin/devin/swe-2:high`. The repeated namespace is intentional (`provider/id`), not a second upstream prefix. Exact fully qualified matches take precedence; this never routes a provider-qualified query to another provider.
 
 ## Model scope enforcement
 

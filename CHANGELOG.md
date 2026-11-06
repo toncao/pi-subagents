@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fork behavior
+
+- Resolve ordered `fallbackModels` before fresh native child startup when the configured primary is absent from the active model registry. Preserve the original requested model, skip unavailable candidates without fabricating attempts, and retain scope, explicit-pin, existing-session and no-replay boundaries across foreground, async and launch-contract preflight paths.
+- Honor ordered `fallbackModels` for broader provider/model failures, including HTTP 401, only while the child has zero useful output, tool history, or mutation evidence. Each zero-progress candidate starts a new child attempt under the original deadline and records attempt evidence; after progress, the existing no-replay contract still permits only same-session exact-model account continuation for rate/quota failures.
+- Preserve configured `fallbackModels` as a narrow no-replay recovery path after completed tools: rate/quota failures may switch the same live child session only to an exact-model account alias, while cancellation, budgets, structured output, incomplete/failed tool history, and cross-provider routes fail closed. Foreground and detached results retain per-account attempt evidence.
+
 ## [0.86.0] - 2026-11-05
 
 ### Highlights
