@@ -315,9 +315,6 @@ interface AsyncSingleParams {
 	modelOrigin?: ModelOrigin;
 	fast?: boolean;
 	thinkingOverride?: AgentConfig["thinking"];
-	/** The forked transcript had signed Anthropic thinking blocks stripped, so Anthropic
-	 * candidates must launch with thinking off while other providers keep reasoning. */
-	forkSanitized?: boolean;
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
 	waitToolEnabled?: boolean;

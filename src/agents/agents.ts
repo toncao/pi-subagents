@@ -62,7 +62,7 @@ export interface BuiltinAgentOverrideBase {
 	defaultReads?: string[];
 	model?: string;
 	modelProvider?: string;
-	/** Ordered exact-model account aliases eligible for same-session continuation. */
+	/** Ordered zero-progress fallbacks; exact-model account aliases may also continue a live session. */
 	fallbackModels?: string[];
 	fast?: boolean;
 	thinking?: string | false;
@@ -162,7 +162,7 @@ export interface AgentConfig {
 	mcpDirectTools?: string[];
 	model?: string;
 	modelProvider?: string;
-	/** Ordered exact-model account aliases eligible for same-session continuation. */
+	/** Ordered zero-progress fallbacks; exact-model account aliases may also continue a live session. */
 	fallbackModels?: string[];
 	fast?: boolean;
 	thinking?: string | false;
