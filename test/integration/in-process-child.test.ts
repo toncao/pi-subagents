@@ -474,6 +474,60 @@ describe("in-process foreground child", () => {
 		]);
 	});
 
+	it("does not continue a live session on another account after the usage budget is exhausted", async () => {
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-budget", name: "read", arguments: { path: "state.txt" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-budget", toolName: "read", args: { path: "state.txt" } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "read-budget", toolName: "read", isError: false, content: [{ type: "text", text: "state" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-budget", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+		] });
+		mockPi.onCall({ output: "must not run" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "anthropic/claude-sonnet-4",
+			fallbackModels: ["anthropic-2/claude-sonnet-4"],
+		})], "worker", "Read once within budget", {
+			runId: "same-session-account-usage-budget",
+			usageBudget: { tokens: { hard: 5 } },
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+			],
+		});
+		assert.equal(result.exitCode, 1);
+		assert.equal(mockPi.sessions.length, 1);
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, []);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), []);
+		assert.deepEqual(result.attemptedModels, ["anthropic/claude-sonnet-4"]);
+	});
+
+	it("still continues a live session on another account while the usage budget has headroom", async () => {
+		const usage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+		mockPi.onCall({ jsonl: [
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "read-headroom", name: "read", arguments: { path: "state.txt" } }], model: "anthropic/claude-sonnet-4", stopReason: "toolUse", usage } },
+			{ type: "tool_execution_start", toolCallId: "read-headroom", toolName: "read", args: { path: "state.txt" } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "read-headroom", toolName: "read", isError: false, content: [{ type: "text", text: "state" }] } },
+			{ type: "tool_execution_end", toolCallId: "read-headroom", toolName: "read" },
+			{ type: "message_end", message: { role: "assistant", content: [], model: "anthropic/claude-sonnet-4", stopReason: "error", errorMessage: "429 rate limit", usage } },
+		] });
+		mockPi.onCall({ output: "continued within budget" });
+		const result = await runSync(tempDir, [makeAgent("worker", {
+			model: "anthropic/claude-sonnet-4",
+			fallbackModels: ["anthropic-2/claude-sonnet-4"],
+		})], "worker", "Read once within budget", {
+			runId: "same-session-account-usage-headroom",
+			usageBudget: { tokens: { hard: 1000 } },
+			availableModels: [
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+				{ provider: "anthropic-2", id: "claude-sonnet-4", fullId: "anthropic-2/claude-sonnet-4" },
+			],
+		});
+		assert.equal(result.exitCode, 0, result.error);
+		assert.deepEqual(mockPi.sessions[0]?.switchedModels, ["anthropic-2/claude-sonnet-4"]);
+		assert.deepEqual(mockPi.sessions[0]?.tasks.slice(1), [SAME_SESSION_ACCOUNT_FALLBACK_NOTICE]);
+	});
+
 	it("uses the same no-replay continuation seam in the detached child driver", async () => {
 		const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
 		mockPi.onCall({ jsonl: [

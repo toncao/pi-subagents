@@ -393,6 +393,8 @@ async function runSingleAttempt(
 		providerDiagnostics?: SingleResult["providerDiagnostics"];
 		/** Ordered, resolved same-model aliases after this launch model. */
 		accountFallbackCandidates?: readonly string[];
+		/** True when this run's reported usage, including this attempt's usage so far, has reached the usage budget hard limit. */
+		usageBudgetExhausted?: (attemptUsage: Usage) => boolean;
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
@@ -1537,7 +1539,7 @@ async function runSingleAttempt(
 						toolCount: progress.toolCount,
 						currentTool: progress.currentTool,
 						cancelled: Boolean(hostStopReason) || abortedBySignal || interruptedByControl || result.timedOut || result.stopped,
-						budgetExhausted: result.toolBudgetBlocked,
+						budgetExhausted: result.toolBudgetBlocked || shared.usageBudgetExhausted?.(result.usage) === true,
 						structuredOutputInvoked: structuredOutputToolInvoked,
 					})) break;
 					const failure = (result.error ?? assistantError)!;
@@ -1546,7 +1548,7 @@ async function runSingleAttempt(
 					clearWatchdogTailTimer();
 					appendRecentOutput(progress, [`[fallback] ${selectedCandidate} reached a runtime rate/quota limit. Continuing the same session with ${nextCandidate}.`]);
 					await created.switchModel(nextCandidate!);
-					if (abortedBySignal || interruptedByControl || result.timedOut || result.stopped) break;
+					if (abortedBySignal || interruptedByControl || result.timedOut || result.stopped || shared.usageBudgetExhausted?.(result.usage) === true) break;
 					failedAccountAttempts.push({ model: selectedCandidate!, success: false, exitCode: 1, error: failure, usage: failedUsage });
 					accountAttemptUsageStart = { ...result.usage };
 					fallbackIndex++;
@@ -2091,6 +2093,13 @@ async function runSyncCompletionInner(
 				launchWarnings,
 				verifyModel,
 				accountFallbackCandidates,
+				usageBudgetExhausted: options.usageBudget
+					? (attemptUsage) => usageBudgetState(options.usageBudget, {
+						inputTokens: aggregateUsage.input + attemptUsage.input,
+						outputTokens: aggregateUsage.output + attemptUsage.output,
+						costUsd: aggregateUsage.cost + attemptUsage.cost,
+					})?.exhausted === true
+					: undefined,
 				providerDiagnostics: lastResult?.providerDiagnostics,
 			});
 			candidateResult = attemptResult;
