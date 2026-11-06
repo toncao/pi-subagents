@@ -19,6 +19,7 @@ export const SUBAGENT_SAFETY_GUIDANCE = `SAFETY-CRITICAL SUBAGENT GUIDANCE:
 - Delegate only when the operator asked, directly or through applicable user/project instructions; size, complexity or risk alone is not authorization.
 - Native async completion wakes this session: return control; do not sleep, poll or call bg_wait for it.
 - One writer per cwd/worktree; isolate concurrent writers.
+- Self-contained child briefs: context/decisions, scope/files, acceptance, validation, evidence, stop/ask; no shared conversation.
 - After a launch or runtime failure, stop and report it; never silently switch to interactive_shell, pi -ne or another CLI.`;
 
 const scriptCalls = "One child: {agent,task}. Independent parallel children: {workflow:\"parallel\",args:{tasks:[{agent,task,cwd?,model?},...]}}. Dependent multi-step work: exactly one top-level subagent workflow call with async:true; write one ```js workflow block in this reply, then call subagent({workflow:true}); children launch only inside it.";
