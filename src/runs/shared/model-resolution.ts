@@ -7,6 +7,8 @@ export type { AvailableModelInfo };
 export interface ModelSelectionEvidence {
 	model?: string;
 	requestedModel?: string;
+	/** Registry selection only: no child request was made for the missing primary. */
+	fallbackSelected?: true;
 }
 
 export { splitThinkingSuffix };
@@ -160,10 +162,14 @@ function resolveBaseModelCandidate(
 	if (exact) return exact.fullId;
 
 	const { queryProvider } = splitQualifiedModelQuery(baseModel, availableModels);
-	if (queryProvider === undefined) {
-		const exactId = resolveExactIdMatches(baseModel, availableModels, preferredProvider);
-		if (exactId) return exactId;
-	}
+	// A provider can register ids that already contain its own namespace, e.g.
+	// provider=devin, id=devin/swe-2. Accept that exact catalog id, but keep a
+	// registered provider prefix binding: never route it to another provider.
+	const exactIdModels = queryProvider === undefined
+		? availableModels
+		: availableModels.filter((entry) => normalizeModelSegment(entry.provider) === queryProvider);
+	const exactId = resolveExactIdMatches(baseModel, exactIdModels, preferredProvider);
+	if (exactId) return exactId;
 
 	const fuzzy = fuzzyResolveModel(baseModel, availableModels, preferredProvider);
 	if (fuzzy || queryProvider === undefined) return fuzzy;
@@ -441,6 +447,8 @@ export interface ResolveModelSelectionOptions {
 	/** The primary model came from the running parent session, not configuration. */
 	primaryModelFromParent?: boolean;
 	origin?: ModelOrigin;
+	/** Used only when a configured (not explicit or inherited) primary is unregistered. */
+	fallbackModels?: readonly string[];
 }
 
 export function resolveModelOrigin(input: {
@@ -482,6 +490,17 @@ export function resolveModelSelection(
 		enforceModelScopes(normalized, scopes, "explicit", options?.onWarn);
 		model = normalized;
 	}
+	// An absent configured primary fails before the runtime retry loop can run.
+	// Resolve the existing ordered fallbacks here instead; never catch scope errors
+	// or reinterpret an explicit pin / inherited model as permission to switch.
+	if (model && origin === "configured" && !options?.primaryModelFromParent
+		&& !resolveSubagentModelCandidate(model.trim(), availableModels, preferredProvider)) {
+		const fallback = resolveZeroProgressFallbackModels(model, options?.fallbackModels, availableModels, preferredProvider, options)[0];
+		if (fallback) {
+			console.warn(`[pi-subagents] Configured model '${model}' is unavailable in this environment; selecting fallback '${fallback}' before child launch.`);
+			return { model: fallback, requestedModel, fallbackSelected: true };
+		}
+	}
 	const resolved = model && (origin === "inherited" || origin === "explicit" || options?.primaryModelFromParent)
 		? model.trim()
 		: model ? resolveRequiredSubagentModelCandidate(model.trim(), availableModels, preferredProvider) : undefined;
@@ -489,6 +508,252 @@ export function resolveModelSelection(
 		enforceModelScopes(resolved, scopes, "inherited", options?.onWarn);
 	}
 	return { ...(resolved ? { model: resolved } : {}), ...(requestedModel ? { requestedModel } : {}) };
+}
+
+/** Resolve the ordered different-model/provider candidates that may be tried only
+ * after a verified zero-progress failure. Unknown candidates are skipped, model
+ * scope is enforced, and the primary is never returned again. */
+export function resolveZeroProgressFallbackModels(
+	primaryModel: string | undefined,
+	fallbackModels: readonly string[] | undefined,
+	availableModels: AvailableModelInfo[] | undefined,
+	preferredProvider?: string,
+	options?: { scope?: ModelScopeCheckRule | ModelScopeCheckRule[]; onWarn?: (violation: ModelScopeViolation) => void },
+): string[] {
+	if (!fallbackModels?.length) return [];
+	const seen = new Set<string>();
+	if (primaryModel) seen.add(splitThinkingSuffix(primaryModel).baseModel);
+	const resolved: string[] = [];
+	for (const fallback of fallbackModels) {
+		const candidate = resolveSubagentModelCandidate(fallback, availableModels, preferredProvider);
+		if (!candidate) {
+			console.warn(`[pi-subagents] Skipping fallback model '${fallback}' because it is unavailable in this environment.`);
+			continue;
+		}
+		const key = splitThinkingSuffix(candidate).baseModel;
+		if (seen.has(key)) continue;
+		enforceModelScopes(candidate, options?.scope, "inherited", options?.onWarn);
+		seen.add(key);
+		resolved.push(candidate);
+	}
+	return resolved;
+}
+
+const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+const ZERO_PROGRESS_MODEL_FAILURE_PATTERNS = [
+	/model_verification_failed/i,
+	/^REQUEST_LIMIT_EXCEEDED$/,
+	/\b40[13]\b/,
+	/\b429\b/,
+	/\b5\d\d\b/,
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/quota/i,
+	/billing/i,
+	/credit/i,
+	/auth(?:entication)?/i,
+	/unauthori[sz]ed/i,
+	/forbidden/i,
+	/api key/i,
+	/token expired/i,
+	/invalid key/i,
+	/provider.*unavailable/i,
+	/model.*(?:unavailable|disabled|not found|load|fail|error)/i,
+	/unknown model/i,
+	/overloaded/i,
+	/service unavailable/i,
+	/temporar(?:ily)? unavailable/i,
+	/connection\s+(?:error|reset|closed|aborted|refused)/i,
+	/fetch failed/i,
+	/network error/i,
+	/socket hang up/i,
+	/stream ended without finish_reason/i,
+	/upstream/i,
+	/timed? out/i,
+	/timeout/i,
+	/internal server error/i,
+	/cold.?start/i,
+	/empty response/i,
+	/no output/i,
+];
+
+function messageHasUsefulProgress(message: unknown): boolean {
+	if (!message || typeof message !== "object") return false;
+	const value = message as { role?: unknown; content?: unknown };
+	if (value.role === "toolResult") return true;
+	if (value.role !== "assistant" || !Array.isArray(value.content)) return false;
+	return value.content.some((part) => {
+		if (!part || typeof part !== "object") return true;
+		const typed = part as { type?: unknown; text?: unknown };
+		if (typed.type === "text") return typeof typed.text !== "string" || typed.text.trim().length > 0;
+		return true;
+	});
+}
+
+function hasPostLaunchUserInput(messages: readonly unknown[]): boolean {
+	let initialTaskSeen = false;
+	for (const message of messages) {
+		if (!message || typeof message !== "object") continue;
+		const value = message as { role?: unknown; content?: unknown };
+		if (value.role !== "user") continue;
+		const text = typeof value.content === "string"
+			? value.content
+			: Array.isArray(value.content)
+				? value.content.map((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" ? (part as { text?: unknown }).text : "").filter((part): part is string => typeof part === "string").join("\n")
+				: "";
+		if (!initialTaskSeen && text.startsWith("Task: ")) {
+			initialTaskSeen = true;
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+/** Admit a new different-model attempt only before the child has produced any
+ * useful output or tool history. A trusted terminal provider error is eligible
+ * regardless of status text; launch-time failures without a terminal message
+ * must match a bounded provider/model pattern. */
+export function isZeroProgressModelFailureAttempt(input: {
+	error?: string;
+	messages?: readonly unknown[];
+	toolCount?: number;
+}): boolean {
+	if (!input.error || TOOL_FAILURE_PREFIX.test(input.error.trim()) || (input.toolCount ?? 0) > 0) return false;
+	const messages = input.messages ?? [];
+	if (hasPostLaunchUserInput(messages) || messages.some(messageHasUsefulProgress)) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object") continue;
+		const terminal = message as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+		if (terminal.role !== "assistant") continue;
+		if (terminal.stopReason === "error" && typeof terminal.errorMessage === "string" && terminal.errorMessage.trim()) {
+			return terminal.errorMessage.trim() === input.error.trim();
+		}
+		break;
+	}
+	return ZERO_PROGRESS_MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(input.error!));
+}
+
+export function formatZeroProgressFallbackNote(model: string, error: string | undefined, nextModel: string): string {
+	const status = error?.match(/\b(?:40[13]|429|5\d\d)\b/)?.[0];
+	const category = status
+		? `HTTP ${status}`
+		: /model_verification_failed/i.test(error ?? "")
+			? "model verification failure"
+			: /rate\s*limit|usage\s*limit|quota/i.test(error ?? "")
+				? "rate/quota failure"
+				: "provider/model failure";
+	return `[fallback] ${model} failed before producing output or tools (${category}). Retrying the original task with ${nextModel}.`;
+}
+
+/** A deliberately small user message: the existing transcript carries the task and completed tool results. */
+export const SAME_SESSION_ACCOUNT_FALLBACK_NOTICE =
+	"The previous account reached a runtime rate or quota limit. Continue the same task from the existing conversation and completed tool results. Do not repeat completed tool calls or redo completed work.";
+
+function parseModelKey(fullId: string): { provider?: string; modelId: string } {
+	const trimmed = splitThinkingSuffix(fullId.trim()).baseModel;
+	const slash = trimmed.indexOf("/");
+	if (slash === -1) return { modelId: trimmed };
+	return { provider: trimmed.slice(0, slash), modelId: trimmed.slice(slash + 1) };
+}
+
+const RUNTIME_RATE_LIMIT_PATTERNS = [
+	/rate\s*limit/i,
+	/usage\s*limit/i,
+	/too many requests/i,
+	/\b429\b/,
+	/quota/i,
+];
+
+function accountProviderFamily(provider: string | undefined): string | undefined {
+	if (!provider) return undefined;
+	if (/^anthropic(?:-\d+|-account-\d+)?$/i.test(provider)) return "anthropic";
+	if (/^openai-codex(?:-\d+|-account-\d+)?$/i.test(provider)) return "openai-codex";
+	const legacy = /^(.*)-account-\d+$/i.exec(provider);
+	return legacy?.[1]?.toLowerCase() ?? provider.toLowerCase();
+}
+
+/** Only account aliases for the exact same model are eligible for post-tool continuation. */
+export function isSameModelAccountFallback(currentModel: string | undefined, nextModel: string | undefined): boolean {
+	if (!currentModel || !nextModel) return false;
+	const current = parseModelKey(currentModel);
+	const next = parseModelKey(nextModel);
+	if (!current.provider || !next.provider || current.modelId !== next.modelId) return false;
+	const currentFamily = accountProviderFamily(current.provider);
+	return currentFamily === accountProviderFamily(next.provider) && current.provider.toLowerCase() !== next.provider.toLowerCase();
+}
+
+/** Resolve configured fallback models, retaining only exact-model aliases from the
+ * same supported account family. Cross-provider/model entries never become live
+ * same-session continuation targets. Unknown candidates are skipped. */
+export function resolveSameModelAccountFallbacks(
+	currentModel: string | undefined,
+	fallbackModels: readonly string[] | undefined,
+	availableModels: AvailableModelInfo[] | undefined,
+	preferredProvider?: string,
+	options?: { scope?: ModelScopeCheckRule | ModelScopeCheckRule[]; onWarn?: (violation: ModelScopeViolation) => void },
+): string[] {
+	if (!currentModel || !fallbackModels?.length || !availableModels?.length) return [];
+	const resolved: string[] = [];
+	for (const fallback of fallbackModels) {
+		const candidate = resolveSubagentModelCandidate(fallback, availableModels, preferredProvider);
+		if (!candidate || !isSameModelAccountFallback(currentModel, candidate)) continue;
+		enforceModelScopes(candidate, options?.scope, "inherited", options?.onWarn);
+		if (!resolved.includes(candidate)) resolved.push(candidate);
+	}
+	return resolved;
+}
+
+function completedToolHistory(messages: readonly unknown[]): { completed: number; safe: boolean } {
+	const pending = new Set<string>();
+	let completed = 0;
+	for (const raw of messages) {
+		if (!raw || typeof raw !== "object") continue;
+		const message = raw as { role?: unknown; content?: unknown; toolCallId?: unknown; isError?: unknown };
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const part of message.content) {
+				if (!part || typeof part !== "object" || (part as { type?: unknown }).type !== "toolCall") continue;
+				const id = (part as { id?: unknown }).id;
+				if (typeof id !== "string" || !id) return { completed, safe: false };
+				pending.add(id);
+			}
+		}
+		if (message.role !== "toolResult") continue;
+		if (message.isError === true || typeof message.toolCallId !== "string" || !pending.delete(message.toolCallId)) {
+			return { completed, safe: false };
+		}
+		completed++;
+	}
+	return { completed, safe: pending.size === 0 };
+}
+
+/**
+ * Fail closed unless a trusted terminal assistant rate/quota error follows a
+ * fully paired, error-free tool history. Tool text merely mentioning 429 can
+ * never satisfy this predicate.
+ */
+export function canContinueSameSessionAfterRateLimit(input: {
+	currentModel?: string;
+	nextModel?: string;
+	error?: string;
+	messages?: readonly unknown[];
+	toolCount?: number;
+	currentTool?: string;
+	cancelled?: boolean;
+	budgetExhausted?: boolean;
+	structuredOutputInvoked?: boolean;
+}): boolean {
+	if (!isSameModelAccountFallback(input.currentModel, input.nextModel)) return false;
+	if (input.cancelled || input.budgetExhausted || input.structuredOutputInvoked || input.currentTool) return false;
+	if ((input.toolCount ?? 0) <= 0 || !input.error || !RUNTIME_RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(input.error!))) return false;
+	const messages = input.messages ?? [];
+	const terminal = messages.at(-1) as { role?: unknown; stopReason?: unknown; errorMessage?: unknown } | undefined;
+	if (terminal?.role !== "assistant" || terminal.stopReason !== "error") return false;
+	if (typeof terminal.errorMessage !== "string" || terminal.errorMessage.trim() !== input.error.trim()) return false;
+	const history = completedToolHistory(messages);
+	return history.safe && history.completed > 0;
 }
 /** Context-overflow signals used to surface a clear input-too-large error. */
 const CONTEXT_OVERFLOW_PATTERNS = [
@@ -516,6 +781,6 @@ export function errorWithoutReplyText(error: string | undefined): string | undef
 export function isContextOverflow(fullError: string | undefined): boolean {
 	const error = errorWithoutReplyText(fullError);
 	if (!error) return false;
-	if (/^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i.test(error.trim())) return false;
+	if (TOOL_FAILURE_PREFIX.test(error.trim())) return false;
 	return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(error));
 }

@@ -148,7 +148,10 @@ function validateSubagentProfile(filePath: string, parsed: Record<string, unknow
 		if (override.machine !== undefined && override.machine !== false) {
 			override.machine = validateOptionalMachine(override.machine, `Profile '${filePath}' has invalid machine for '${name}'`);
 		}
-		if ((override as Record<string, unknown>).fallbackModels !== undefined) throw new Error(`Profile '${filePath}' uses removed field fallbackModels for '${name}'; configure one model instead.`);
+		const fallbackModels = override.fallbackModels;
+		if (fallbackModels !== undefined && (!Array.isArray(fallbackModels) || fallbackModels.some((entry) => typeof entry !== "string" || !entry.trim()))) {
+			throw new Error(`Profile '${filePath}' has invalid fallbackModels for '${name}'; expected non-empty strings.`);
+		}
 	}
 	const disableBuiltins = (subagents as Record<string, unknown>).disableBuiltins;
 	if (disableBuiltins !== undefined && typeof disableBuiltins !== "boolean") {

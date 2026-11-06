@@ -851,6 +851,7 @@ export interface SteeringRecoveryDescriptor {
 	cwd: string;
 	model?: string;
 	modelProvider?: string;
+	fallbackModels?: string[];
 	modelOverrideFromParent?: boolean;
 	modelOrigin?: "explicit" | "inherited" | "configured";
 	fast?: boolean;
@@ -1271,6 +1272,14 @@ export interface UsageBudgetState {
 	reason?: "tokens" | "costUsd";
 }
 
+export interface ModelAttempt {
+	model: string;
+	success: boolean;
+	exitCode: number;
+	error?: string;
+	usage?: Usage;
+}
+
 export interface SingleResult {
 	/**
 	 * Stable child identity within the foreground run. Pair with Details.runId for
@@ -1306,6 +1315,9 @@ export interface SingleResult {
 	providerDiagnostics?: SubagentDelegationProviderDiagnostics;
 	usage: Usage;
 	model?: string;
+	/** Ordered model candidates attempted, including zero-progress fresh attempts and same-session account continuation. */
+	attemptedModels?: string[];
+	modelAttempts?: ModelAttempt[];
 	/** Authoritative before/after Git evidence captured by a pane-native remote machine. */
 	nativeMachine?: { provider: PlacementMachineReference["provider"]; machineId: string; initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus };
 	/** Effective thinking level used by this foreground child, when known. */
@@ -2061,6 +2073,8 @@ export interface AsyncStatus {
 		launchModel?: string;
 		/** Provider and model recorded on this child's latest own live assistant reply; never the requested model. */
 		resolvedModel?: { provider: string; model: string };
+		attemptedModels?: string[];
+		modelAttempts?: ModelAttempt[];
 		thinking?: string;
 		contextLimit?: number;
 		thinkingCeiling?: ThinkingLevel;
@@ -2595,6 +2609,9 @@ export interface RunSyncOptions {
 	modelOrigin?: "explicit" | "inherited" | "configured";
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
+	/** The forked transcript had signed Anthropic thinking blocks stripped. Anthropic
+	 * candidates then launch with thinking off, while other providers keep reasoning. */
+	forkSanitized?: boolean;
 	thinkingCeiling?: ThinkingLevel;
 	requiredExtensions?: RequiredChildExtensionSnapshot;
 	extensionBindings?: ExtensionBindings;

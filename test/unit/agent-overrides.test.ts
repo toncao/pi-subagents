@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll, removeBuiltinAgentOverride, saveBuiltinAgentOverride } from "../../src/agents/agents.ts";
 
+import { resolveModelSelection } from "../../src/runs/shared/model-resolution.ts";
+
 let tempHome = "";
 let tempProject = "";
 const originalHome = process.env.HOME;
@@ -58,6 +60,23 @@ describe("builtin agent overrides", () => {
 		else process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = originalExtraAgentDirs;
 		fs.rmSync(tempHome, { recursive: true, force: true });
 		fs.rmSync(tempProject, { recursive: true, force: true });
+	});
+
+	it("loads a placeholder primary override and selects its first registered fallback", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { worker: {
+				model: "openai/placeholder",
+				fallbackModels: ["openai-codex/gpt-6.1-sol:low", "openai-codex-2/gpt-6.1-sol:low"],
+			} } },
+		});
+		const worker = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "worker")!;
+		assert.equal(worker.model, "openai/placeholder");
+		const selected = resolveModelSelection(worker.model, [
+			{ provider: "openai-codex", id: "gpt-6.1-sol", fullId: "openai-codex/gpt-6.1-sol" },
+			{ provider: "openai-codex-2", id: "gpt-6.1-sol", fullId: "openai-codex-2/gpt-6.1-sol" },
+		], worker.modelProvider, { fallbackModels: worker.fallbackModels });
+		assert.equal(selected.model, "openai-codex/gpt-6.1-sol:low");
+		assert.equal(selected.requestedModel, "openai/placeholder");
 	});
 
 	it("bundled builtin agents inherit the default model", () => {
@@ -159,18 +178,23 @@ describe("builtin agent overrides", () => {
 		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "coordinator")?.allowedAgents, ["reviewer", "worker"]);
 	});
 
-	it("rejects removed fallbackModels in user agent overrides", () => {
+	it("loads user and project fallbackModels overrides in precedence order", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+			subagents: { agentOverrides: { worker: { fallbackModels: ["anthropic-2/model"] } } },
 		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
+		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "worker")?.fallbackModels, ["anthropic-2/model"]);
+
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { worker: { fallbackModels: ["anthropic-3/model"] } } },
+		});
+		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "worker")?.fallbackModels, ["anthropic-3/model"]);
 	});
 
-	it("rejects removed fallbackModels in project agent overrides", () => {
-		writeJson(path.join(tempProject, ".pi", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+	it("rejects malformed fallbackModels overrides", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { worker: { fallbackModels: ["anthropic-2/model", 42] } } },
 		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
+		assert.throws(() => discoverAgentsAll(tempProject), /invalid 'fallbackModels'/u);
 	});
 
 	it("lets a builtin agent inherit Pi's normal tools from an override", () => {
